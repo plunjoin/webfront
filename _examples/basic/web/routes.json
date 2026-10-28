@@ -1,0 +1,4 @@
+[
+  { "path": "/", "props": { "title": "webfront SSR Demo", "name": "零 Node 世界", "path": "/" } },
+  { "path": "/about", "props": { "title": "About", "name": "关于页（预渲染）", "path": "/about" } }
+]

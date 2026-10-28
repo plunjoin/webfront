@@ -1,0 +1,21 @@
+# 构建产物
+*.exe
+*.test
+*.out
+
+# 测试文件
+*_test.go
+
+# 前端产物（wf build 生成）
+**/dist/*
+!**/dist/.gitkeep
+
+# 依赖 store（wf install 生成，等同 node_modules）
+**/wf_modules/
+**/node_modules/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
