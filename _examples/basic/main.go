@@ -8,7 +8,7 @@
 //
 // 第 2 步，在本目录按需选形态：
 //
-//	go build -ldflags "-s -w" -o app.exe .               → 预渲染静态（无引擎，6.9MB）
+//	go build -ldflags "-s -w" -o app.exe .               → 预渲染静态（无引擎，7.0MB）
 //	go build -tags dynamic -ldflags "-s -w" -o app.exe . → 动态 SSR / goja（15.6MB）
 //	go build -tags dev -ldflags "-s -w" -o app.exe .     → 开发服务器（esbuild + HMR，11.4MB）
 //	go run -tags dev . dev                               → 开发模式（带 HMR 热更）

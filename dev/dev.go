@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/evanw/esbuild/pkg/api"
 	"github.com/fsnotify/fsnotify"
@@ -33,6 +34,42 @@ type DevServer struct {
 	depsCache  map[string][]byte
 	rootDeps   map[string]string
 	modulesDir string
+
+	// 最近一次编译错误。浏览器 import() 失败时拿不到是哪个文件坏的
+	// （嵌套依赖只会抛一句 "Failed to fetch dynamically imported module"），
+	// 所以服务端留一份，客户端通过 /__wf_error?since=N 取回原文。
+	errMu   sync.Mutex
+	errSeq  int64
+	lastErr *compileError
+}
+
+// compileError 是一条编译错误的快照，JSON 直接喂给浏览器。
+type compileError struct {
+	ID   int64  `json:"id"`
+	Path string `json:"path"`
+	Body string `json:"body"`
+	At   string `json:"at"`
+}
+
+// recordError 记下这次编译失败（只保留最近一条，够用且不会涨内存）。
+func (d *DevServer) recordError(path, body string) {
+	d.errMu.Lock()
+	d.errSeq++
+	d.lastErr = &compileError{
+		ID:   d.errSeq,
+		Path: path,
+		Body: body,
+		At:   time.Now().Format("15:04:05"),
+	}
+	d.errMu.Unlock()
+}
+
+// fail 统一处理"这个文件编译不过"：记一笔 + 500 + 可读文本。
+// 响应体就是覆盖层要展示的原文，所以这里不要再加多余前缀。
+func (d *DevServer) fail(w http.ResponseWriter, path, body string) {
+	body = strings.TrimRight(body, "\n")
+	d.recordError(path, body)
+	http.Error(w, body, http.StatusInternalServerError)
 }
 
 func NewDevServer(root string) (*DevServer, error) {
@@ -184,7 +221,24 @@ func (d *DevServer) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// 最近一次编译错误：嵌套 import 失败时，浏览器只能拿到一句
+	// "Failed to fetch dynamically imported module"，靠它换回真正的错误原文。
+	mux.HandleFunc("/__wf_error", d.serveLastError)
 	return mux
+}
+
+func (d *DevServer) serveLastError(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	d.errMu.Lock()
+	e := d.lastErr
+	d.errMu.Unlock()
+	if e == nil || e.ID <= since {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(e)
 }
 
 // serveIndex 注入 HMR 客户端脚本 + ImportMap + 模块入口。
@@ -206,114 +260,15 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 		importMapTag = "\n  <script type=\"importmap\">\n  " + string(importMapJSON) + "\n  </script>\n"
 	}
 
-	entry := strconv.Quote(d.entry)
-	html := fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8"><title>webfront dev (HMR)</title>`+
-		importMapTag+
-		`</head>
-<body>
-<div id="root"></div>
-<script>
-const OVERLAY_ID = '__wf_dev_overlay';
-function showOverlay(text) {
-  let el = document.getElementById(OVERLAY_ID);
-  if (!el) {
-    el = document.createElement('div');
-    el.id = OVERLAY_ID;
-    el.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(17,24,39,.94);color:#e5e7eb;font:13px/1.9 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;text-align:center';
-    document.body.appendChild(el);
-  }
-  el.textContent = text;
-}
-function hideOverlay() {
-  const el = document.getElementById(OVERLAY_ID);
-  if (el) el.remove();
-}
-
-// import() 失败时只给一句 "Failed to fetch dynamically imported module"，
-// 真正的编译错误在 500 的响应体里，所以再取一次。
-async function showError(path, err) {
-  let detail = (err && err.message) ? err.message : String(err);
-  try {
-    const r = await fetch(path + '?t=' + Date.now(), { cache: 'no-store' });
-    if (!r.ok) {
-      const text = await r.text();
-      if (text) detail = text;
-    }
-  } catch (_) {}
-  showOverlay('编译失败：' + path + '\n\n' + String(detail).trim() + '\n\n修好后会自动刷新');
-}
-
-let render = null;
-let connected = false;
-
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  const ws = new WebSocket(proto + location.host + '/__wf_hmr');
-
-  ws.onopen = () => {
-    connected = true;
-    hideOverlay();
-  };
-
-  ws.onmessage = async (e) => {
-    const m = JSON.parse(e.data);
-    if (m.type !== 'update') return;
-    try {
-      const isCSS = m.path.endsWith('.css');
-      const mod = await import(m.path + '?t=' + Date.now());
-      hideOverlay();
-      if (mod.render) {
-        render = mod.render;
-        render();
-      } else if (isCSS) {
-        // .css 模块已动态更新注入 DOM，无需刷新页面
-      } else {
-        // 普通子组件（如 App.tsx、App.vue 等）：触发轻量刷新以穿透浏览器 ESM 缓存
-        location.reload();
-      }
-    } catch (err) {
-      // 编译失败时不要 reload：那会变成白屏 + 控制台报错。把错误摆在页面上，
-      // 等下一次成功的 update 自然刷新。
-      console.error('[HMR] update failed', err);
-      await showError(m.path, err);
-    }
-  };
-
-  // 连接断开只有两种可能：页面正在跳转，或服务端没了（wf dev 正在重启
-  // Go 进程 / 进程崩了）。后者的正确姿势是等新进程起来再整页重载，
-  // 而不是立刻 reload —— 那会撞上一个"无法连接"的错误页。
-  ws.onclose = () => {
-    if (!connected) return;
-    connected = false;
-    // 600ms 才开始提示：实测 kill + 重启只有 300~500ms，太早弹层会闪一下。
-    setTimeout(() => showOverlay('⏳ 后端重启中…\nwf dev 正在重新编译 Go 代码，稍后自动刷新'), 600);
-    (async () => {
-      for (;;) {
-        try {
-          await fetch('/__wf_ping?t=' + Date.now(), { cache: 'no-store' });
-          break;
-        } catch (_) {
-          await new Promise((r) => setTimeout(r, 300));
-        }
-      }
-      location.reload();
-    })();
-  };
-}
-connect();
-
-import(%s + '?t=' + Date.now()).then(m => {
-  hideOverlay();
-  // main.* 约定导出 render() 以便热替换；entry-client.* 自己挂载，没有 render 也正常。
-  if (m && typeof m.render === 'function') { render = m.render; render(); }
-}).catch(e => {
-  console.error('[HMR] initial import failed', e);
-  showError(%s, e);
-});
-</script>
-</body></html>`, entry, entry)
+	// 用字符串拼接而不是 Sprintf：客户端脚本里将来出现 % 也不会被当成格式动词。
+	html := "<!doctype html><html><head><meta charset=\"utf-8\"><title>webfront dev (HMR)</title>" +
+		importMapTag +
+		"</head>\n<body>\n<div id=\"root\"></div>\n<script>\n" +
+		clientScript(d.entry) +
+		"</script>\n</body></html>"
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(html))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(html))
 }
 
 // serveDeps 按需打包 npm 依赖包为 ESM 并缓存。
@@ -357,7 +312,7 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 	}
 	res := api.Build(opts)
 	if len(res.Errors) > 0 {
-		http.Error(w, "bundle dep "+pkgSpec+" error:\n"+compiler.FormatMessages(res.Errors), http.StatusInternalServerError)
+		d.fail(w, "/@deps/"+raw, "bundle dep "+pkgSpec+" error:\n"+compiler.FormatMessages(res.Errors))
 		return
 	}
 
@@ -383,11 +338,22 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad path: "+rel, http.StatusBadRequest)
 		return
 	}
-	src, err := os.ReadFile(full)
+	src, full, err := d.readSrc(full)
 	if err != nil {
-		http.Error(w, "not found: "+rel, 404)
+		// 文件不存在也要记一笔：子模块 404 在浏览器侧同样只会得到
+		// "Failed to fetch dynamically imported module"，看不出是哪个文件。
+		body := "模块不存在：" + r.URL.Path + "\n\nwf dev 只服务 " +
+			filepath.ToSlash(filepath.Join(d.root, "src")) + " 下的文件。"
+		d.recordError(r.URL.Path, body)
+		http.Error(w, body, http.StatusNotFound)
 		return
 	}
+	// 补全后的真实路径才是 Sourcefile 该用的名字：浏览器请求 /src/App，
+	// 但错误里必须写 App.tsx，否则用户按行号找不到文件。
+	if r2, relErr := filepath.Rel(filepath.Join(d.root, "src"), full); relErr == nil {
+		rel = filepath.ToSlash(r2)
+	}
+	srcURL := "/src/" + rel
 	ext := filepath.Ext(full)
 	switch ext {
 	case ".tsx", ".ts", ".jsx", ".js":
@@ -407,7 +373,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, compiler.FormatMessages(res.Errors), 500)
+			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
@@ -419,7 +385,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Sourcefile: rel,
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, compiler.FormatMessages(res.Errors), 500)
+			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
 			return
 		}
 		cssJSON, _ := json.Marshal(string(res.Code))
@@ -430,7 +396,9 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 	case ".vue":
 		res, err := compiler.CompileSFCResult(d.root, d.modulesDir, string(src), full)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("vue compile error: %v", err), http.StatusInternalServerError)
+			// err 自带文件名与阶段（parse / compileScript / compileTemplate / <style>），
+			// 不再加前缀，覆盖层会把首行当标题。
+			d.fail(w, srcURL, err.Error())
 			return
 		}
 		// 与构建期一致：lang="ts" 的产物要再过一遍 TS 转译，否则浏览器会在
@@ -442,14 +410,55 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(tr.Errors) > 0 {
-			http.Error(w, "vue ts transform error:\n"+compiler.FormatMessages(tr.Errors), http.StatusInternalServerError)
+			d.fail(w, srcURL, "vue ts transform error:\n"+compiler.FormatMessages(tr.Errors))
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write(tr.Code)
+	case ".json":
+		res := api.Transform(string(src), api.TransformOptions{
+			Loader:     api.LoaderJSON,
+			Format:     api.FormatESModule,
+			Sourcefile: rel,
+		})
+		if len(res.Errors) > 0 {
+			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write(res.Code)
 	default:
 		http.Error(w, "webfront dev: unsupported source type "+ext, http.StatusBadRequest)
 	}
+}
+
+// srcExts 是"无扩展名导入"的补全顺序，与 esbuild 的 resolveExtensions 一致。
+var srcExts = []string{".tsx", ".ts", ".jsx", ".js", ".vue", ".css", ".json"}
+
+// readSrc 读源码文件，并按 Vite 的规则补全路径。
+//
+// 浏览器不做扩展名补全：`import App from './App'` 会原样请求 /src/App。
+// 构建期由 esbuild 解析，dev 期没人代劳，所以这里补：
+// 原路径 → 路径+扩展名 → 路径/index+扩展名。
+func (d *DevServer) readSrc(full string) ([]byte, string, error) {
+	if b, err := os.ReadFile(full); err == nil {
+		return b, full, nil
+	}
+	if filepath.Ext(full) == "" {
+		for _, ext := range srcExts {
+			p := full + ext
+			if b, err := os.ReadFile(p); err == nil {
+				return b, p, nil
+			}
+		}
+	}
+	for _, ext := range srcExts {
+		p := filepath.Join(full, "index"+ext)
+		if b, err := os.ReadFile(p); err == nil {
+			return b, p, nil
+		}
+	}
+	return nil, full, os.ErrNotExist
 }
 
 func (d *DevServer) serveWS(w http.ResponseWriter, r *http.Request) {

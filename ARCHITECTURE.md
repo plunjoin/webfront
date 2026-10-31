@@ -560,11 +560,12 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 | 路由 | 行为 |
 | --- | --- |
-| `GET /` | 返回注入 HMR 客户端的 HTML 骨架 |
+| `GET /` | 返回注入 HMR 客户端（含错误覆盖层）的 HTML 骨架 |
 | `GET /src/*` | 读源文件 → `esbuild.Transform`（毫秒级）→ 返回 ESM |
 | `GET /@deps/*` | 按需打包 npm 裸模块为 ESM 并内存缓存（配合 ImportMap 极速裸导入） |
 | `GET /__wf_hmr` | 升级 WebSocket，推送变更事件 |
 | `GET /__wf_ping` | 204 + `no-store`；Go 进程重启期间浏览器靠它判断"服务回来了没有" |
+| `GET /__wf_error` | 最近一次编译错误（`{id,path,body,at}`）；`?since=N` 已是最新时 204 |
 
 按需单文件转译的类型支持：
 
@@ -572,7 +573,14 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 | --- | --- |
 | `.ts` / `.tsx` / `.js` / `.jsx` | `api.Transform` → ESM，`process.env.NODE_ENV="development"` |
 | `.css` | Transform 出 CSS 后包成"导入即注入 `<style>`"的 ESM 模块 |
+| `.json` | `LoaderJSON` + `FormatESModule` → `export default {...}` |
 | `.vue` | `compiler.CompileSFCResult`（SFC 编译 + 预处理器 + 作用域样式提取注入 + 预编译 VM 池） |
+
+**扩展名补全**：浏览器不做解析，`import App from './App'` 会原样请求 `/src/App`。构建期由
+esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 自己按
+「原路径 → 路径+`.tsx|.ts|.jsx|.js|.vue|.css|.json` → 路径/`index.*`」补全。
+不补的话，任何带相对导入的工程一进 dev 就 404 —— 而且浏览器只会回一句
+`Failed to fetch dynamically imported module`，看不出是哪个文件。
 
 ### 7.2 HMR 协议
 
@@ -586,7 +594,7 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 1. **主入口模块**（包含 `render` 导出）：直接调用最新 `mod.render()` 实现原地热替换；
 2. **`.css` 样式模块**：执行 `import(path + '?t=...')` 动态更新覆盖 DOM 中的 `<style>` 标签，无需整页刷新；
 3. **普通子组件**（如 `App.tsx`、`App.vue`）：触发轻量整页刷新（依赖已被内存缓存，耗时 < 50ms），彻底穿透浏览器原生静态 ESM 缓存。
-4. **编译失败**：`import()` reject，此时**不能刷新**（刷新只会白屏）。客户端回读那个 500 的响应体，把真正的错误（`文件:行:列` + 代码片段）盖在页面上，等下一次成功的 update 再自动刷新。
+4. **编译失败**：`import()` reject，此时**不能刷新**（刷新只会白屏）。客户端回读那个 500 的响应体，把真正的错误盖在页面上，等下一次成功的 update 自动收场（见 §7.4）。
 
 > 错误一律是 `error` 返回值而不是 panic：goja 的 JS 异常本来就以 `*goja.Exception` 返回，各阶段再包上文件名与阶段名（`parse` / `compileScript` / `compileTemplate` / `compileStyle` / 预处理器）；`CompileSFCResult` 与 `preprocessStyle` 外面还各有一层 `recover`，保证即使 VM 或宿主回调出了意外，也不会把 dev server / 构建进程带走。
 
@@ -628,6 +636,50 @@ Go 没有热替换：进程里的机器码换不掉，`plugin` 只在 Linux 上�
 | 服务回来 | `location.reload()`，拿到新编译的后端与新 importmap |
 
 用"任何 HTTP 响应都算活"而不是"必须 200"，是为了让自定义 404 页 / 反向代理下的应用也能正常恢复。
+
+### 7.4 错误反馈：四类错误，一个前台的落点
+
+Vite 之所以"好用"，很大一部分是**报错永远在你看得见的地方**。本项目对齐这条，落点是
+`devui` 包（纯标准库，≈12KB）：
+
+```
+devui.overlayCSS      覆盖层与错误页共用的一套样式
+devui.ClientScript()  注入 dev 页面的 window.__wfOverlay = { show, hide, kind }
+devui.ErrorPage()     独立错误页（SSR/goja 失败时当响应体整页返回）
+```
+
+四类错误、四条通道：
+
+| 来源 | 通道 | 前台表现 |
+| --- | --- | --- |
+| 前端编译失败（tsx/vue/css） | `import()` reject → 回读 500 响应体 → `__wfOverlay.show` | 红色"编译失败" + `文件:行:列` + 代码框 |
+| 嵌套依赖坏了 | 直接请求该模块返回 200 → `GET /__wf_error?since=N` 取最近一条 | 同上，`file` 指向真正坏掉的文件 |
+| 浏览器运行期异常 | `window.onerror` / `unhandledrejection` | "运行期错误" + JS 栈（栈帧压暗） |
+| SSR / goja 渲染失败 | `webfront.Engine.writeRenderError` | 整页错误页（`Config.Dev` 或 `WF_DEV=1`），生产态只回干净 500 |
+| Go 进程重启 | WebSocket `onclose` → 轮询 `/__wf_ping` | 琥珀色"后端重启中"，服务回来自动刷新 |
+
+几个不显眼但必要的决定：
+
+1. **Shadow DOM，不是普通 div**。宿主页面一句 `* { color: #fff }` 或 `body > div { display:none }`
+   就能让错误看不见。覆盖层挂在 `<html>` 下、样式塞进 `attachShadow({mode:'open'})`，
+   页面 CSS 改不动它，`z-index` 固定 `2147483647`。
+2. **`/__wf_error` 是给"嵌套依赖"用的**。浏览器对 `import('./App.tsx')` 里再 import 的
+   子模块失败，只会把错误算在**外层模块**头上，且消息固定是
+   `Failed to fetch dynamically imported module` —— 完全无法定位。服务端在每次 500 / 404
+   时记一条 `{id,path,body}`，客户端用 `?since=` 取回，于是能看到 `Broken.tsx:1:17` 的代码框。
+3. **失败不 `reload()`**。这是最容易写错的一步：`location.reload()` 会让页面变白，
+   用户以为整个应用挂了。正确做法是留在原地展示错误，等下一次成功的 HMR 自然收场。
+4. **SSR 错误由引擎自己写响应**。调用方几乎都写成 `_ = eng.Render(w, r, page)`，
+   只 `return err` 等于把错误扔了 —— 浏览器收到的是一个**空白的 200**。
+   所以 `Render` 在返回 error 之前就把错误页写进 `ResponseWriter`。
+5. **生产态不泄露栈**。`writeRenderError` 分两路：开发态给完整 goja 栈并 `log.Printf` 到终端，
+   生产态只回 `webfront: 页面渲染失败（详情见服务端日志）`。
+
+实测（Chromium，`_examples/basic`）：改坏 `main.tsx` → 覆盖层出现，标题"编译失败"、
+副标题 `/src/main.tsx`、代码框带行号与插入符；`Esc` 可关；点"重新加载"仍在（错误还在）；
+改回原文件 → 自动消失；`throw new Error('boom-runtime')` → "运行期错误" + 栈；
+`Promise.reject` → "未处理的 Promise 拒绝"；`import './Broken'`（坏文件）→ 定位到
+`/src/Broken.tsx` 而不是那句 `Failed to fetch`。
 
 ---
 
@@ -725,6 +777,8 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 | 8 | 🟢 低 | **（使用侧）Gin `*` 模式不匹配裸前缀** | 这是 Gin 的行为不是库的问题：`r.Any("/admin/*filepath")` 不含 `/admin`，需补精确路由或建 group。 |
 | 9 | 🟢 低 | **未用 `-race` 检测** | `-race` 要求 cgo，与零 CGO 铁律冲突。并发安全靠"池单 VM 单 goroutine"语义保证，已用 4 VM / 500 请求压测零串台。 |
 | 10 | 🟢 低 | **`wf dev` 的 Go 热更是重启进程** | Go 无法热替换机器码，重启窗口（2–3s）内请求会失败。只用于开发；线上靠多副本滚动更新，不依赖它。 |
+| 11 | 🟢 低 | **SSR 错误页的栈指向打包产物** | goja 报的是 `ssr.js:1482:19`，不是 `App.tsx:12`。要精确到源码行，得给 SSR bundle 生成 source map 并做映射（esbuild 能出，尚未接）。生产构建不输出栈，所以不影响线上。 |
+| 12 | 🟢 低 | **开发态错误页依赖 `Config.Dev` / `WF_DEV`** | 直接 `go run .` 起服务时只有干净的 500。`wf dev` 会自动注入 `WF_DEV=1`，这也是推荐用法。 |
 
 ---
 
@@ -745,14 +799,30 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 
 | 项 | 结果 |
 | --- | --- |
-| dev server `GET /` | ✅ 200 / 675 B，含 `new WebSocket('ws://' + location.host + '/__wf_hmr')` |
+| dev server `GET /` | ✅ 200 / 15,331 B（内联了错误覆盖层，见 §7.4；dev 不压缩，换取零依赖注入），含 `new WebSocket(...+'/__wf_hmr')` 与 `window.__wfOverlay` |
 | dev server `GET /src/App.tsx` | ✅ 200 / 633 B，正确转译为 `React.createElement("div", { className: "app", "data-ssr": "true" }` |
 | 动态 SSR `GET /` | ✅ 200 / 473 B / 毫秒级（goja 单次渲染 1.6–4.2 ms） |
 | 静态模式（移走磁盘 `web/dist`，纯 embed） | ✅ `/` 200/473B、`/about` 200/477B、`/nope` 404、`client.js` 200/816B、chunk 200/45,279B（gzip） |
 | Vue 3 SFC 编译 + SSR（Proxy + 异步 `renderToString`） | ✅ 全在 goja 下跑通（编译期 `@vue/compiler-sfc` 也在 goja 里执行） |
 | 条件请求 | ✅ `If-None-Match` 命中返回 304 |
 
-### 11.3 交叉验证：渲染输出逐字节一致
+### 11.3 错误前台化（Chromium 实测）
+
+| 场景 | 结果 |
+| --- | --- |
+| 改坏 `src/main.tsx`（`const broken = ;`） | ✅ 覆盖层弹出：标题"编译失败"、`/src/main.tsx`、代码框 `12 │ const broken = ;` + 红色插入符 |
+| 按 `Esc` | ✅ 关闭 |
+| 关掉后 `location.reload()` | ✅ 覆盖层重新出现（首屏 import 失败同样前台可见） |
+| 点"重新加载" | ✅ 按钮生效 |
+| 改回原文件 | ✅ 覆盖层自动消失，无需手动刷新 |
+| `throw new Error('boom-runtime')` | ✅ "运行期错误" + `Error: boom-runtime` + 压暗的栈帧 |
+| `Promise.reject(...)` | ✅ "未处理的 Promise 拒绝" |
+| `import './Broken'`（`Broken.tsx` 有语法错） | ✅ `file` 定位到 `/src/Broken.tsx`，而不是 `Failed to fetch dynamically imported module` |
+| SSR 渲染失败（goja 抛错） | ✅ 500 + `text/html` 错误页（标题"SSR 渲染失败"、goja 栈、`no-store`），终端同时打印 |
+| 同上但生产态（`Dev=false`） | ✅ 500 + 一句话，栈不出现在响应体里 |
+| 覆盖层被页面 CSS 影响 | ✅ 无（Shadow DOM + `z-index: 2147483647`） |
+
+### 11.4 交叉验证：渲染输出逐字节一致
 
 同一路由 `/` 由不同路径产出，用 `cmp` 比对**逐字节相同**：
 

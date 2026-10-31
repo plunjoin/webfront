@@ -14,7 +14,7 @@ mux.Handle("/", engine)
 | 零 Node.js | 编译 `.tsx` / `.vue`、打包、SSR、装依赖，全程没有 `node` 进程 |
 | 零 CGO | `CGO_ENABLED=0` 可构建，Windows 上 `GOOS=linux go build` 直接出 Linux 二进制 |
 | 单二进制 | 前端产物 `//go:embed` 进可执行文件，部署只需拷一个文件 |
-| 可选引擎 | 不渲染动态页面就不链接 JS 引擎，二进制 6.9MB；要动态 SSR 才 +9.5MB |
+| 可选引擎 | 不渲染动态页面就不链接 JS 引擎，二进制 7.0MB；要动态 SSR 才 +9.5MB |
 | 框架无关 | 库本身不依赖任何 Web 框架（`go.mod` 只有 4 个直接依赖） |
 
 ---
@@ -342,7 +342,13 @@ Go 进程里的机器码换不掉，所以这里不是"热替换"，而是**重�
 - **崩了也能自己起来**。子进程 panic 退出后监听不中断，改完代码自动拉起。
 - 监听范围是整个模块（`go.mod` 所在目录，含子包），跳过 `node_modules` / `wf_modules` / `dist` / `vendor` / `.git`，也跳过 `*_test.go` 和编辑器临时文件。
 
-> **报错怎么呈现**：编译错误永远是 `error` 返回值，不是 panic —— 一次语法错误不会把 dev server 带走。开发态直接盖在页面上（`文件:行:列` + 代码片段 + "修好后自动刷新"），构建态由 esbuild 打印带 code frame 的错误并以非 0 退出。
+> **报错怎么呈现**：编译错误永远是 `error` 返回值，不是 panic —— 一次语法错误不会把 dev server 带走。开发态一律摆到**前台**（Vite 同款错误覆盖层：标题 + `文件:行:列` + 带行号/插入符的代码框 + Esc/点击关闭 + 重新加载按钮），构建态由 esbuild 打印带 code frame 的错误并以非 0 退出。
+>
+> 覆盖层覆盖四类错误，不用开 DevTools 猜：
+> - **前端编译失败**（tsx/vue/css）—— 回读 500 响应体拿原文；嵌套依赖坏了也能定位到真正出错的文件（浏览器只会说一句 `Failed to fetch dynamically imported module`，服务端用 `/__wf_error` 补上）；
+> - **浏览器运行期异常** —— `window.onerror` 与 `unhandledrejection` 都接，带 JS 栈；
+> - **Go 进程重启** —— 琥珀色"后端重启中"，服务回来自动刷新；
+> - **SSR / goja 渲染失败** —— 调用方普遍写 `_ = eng.Render(...)`，所以引擎自己把响应写成错误页（`Config.Dev` 或 `WF_DEV=1` 时），生产态只回干净的 500，不泄露内部栈。
 
 代价是重启窗口内（通常 2–3s）的请求会失败——这是进程级重启绕不开的；需要零中断就得自己做多进程热切，不在本项目的取舍范围内。
 
@@ -415,6 +421,8 @@ export async function render(url: string, props: Record<string, any>) {
 | 预渲染内容构建期固定 | 动态数据进不去 | 动态页面用 `-tags dynamic`，或客户端补 |
 | `lang="stylus"` / `lang="pug"` 无对应预处理器 | 这两类 SFC 编译不过 | 先手动编译成 css / html，或换 scss、less |
 | `wf dev` 的 Go 热更是"重启进程" | 重启窗口（2–3s）内请求会失败 | 只用于开发；线上靠多副本滚动更新 |
+| 错误页里的栈指向打包产物 | SSR 报错显示 `ssr.js:1482:19`，不是 `App.tsx:12` | 生产构建不输出栈；需要精确行号时用 `wf build` 的报错（esbuild 有 code frame） |
+| 开发态错误页只在 `Config.Dev` / `WF_DEV` 下出现 | 直接 `go run .` 起服务时看不到可视化错误 | `wf dev` 会自动注入 `WF_DEV=1` |
 
 ---
 
@@ -426,6 +434,7 @@ webfront/
 ├── compiler/                 构建期：esbuild / SFC / store / SSG
 ├── jsruntime/                运行期：goja 引擎池
 ├── dev/                      开发态：转译 + HMR
+├── devui/                    开发态错误界面：覆盖层 + 错误页（纯标准库）
 ├── cmd/wf/                   极薄 CLI
 ├── _examples/basic/          可运行示例（三形态）
 └── ARCHITECTURE.md           设计文档：为什么这么选、怎么验证的
@@ -445,7 +454,7 @@ go run ./cmd/wf build -modules wf_modules \
 
 # 2) 三种形态任选
 cd _examples/basic
-go run .                       # 静态，6.9MB
+go run .                       # 静态，7.0MB
 go run -tags dynamic .         # 动态 SSR，15.6MB
 go run -tags dev . dev         # 开发服务器（改 web/src 即热更）
 
