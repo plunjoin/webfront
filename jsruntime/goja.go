@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
@@ -86,6 +87,10 @@ func (p *Pool) createVM() (*goja.Runtime, error) {
 const shim = `
 if (typeof globalThis === 'undefined') { globalThis = this; }
 if (typeof globalThis.__WF_STYLES__ === 'undefined') { globalThis.__WF_STYLES__ = []; }
+// SFC 的样式注入发生在模块求值（bundle 加载）阶段，而 renderScript 每渲染一次
+// 都会把 __WF_STYLES__ 换成新数组。这里先把"模块加载期收集到的样式"固定下来，
+// 否则它们会在首次渲染前被清空，SSR 首屏就没有 <style>（FOUC）。
+if (typeof globalThis.__WF_STYLES_BASE__ === 'undefined') { globalThis.__WF_STYLES_BASE__ = globalThis.__WF_STYLES__; }
 function TextEncoder(){}
 TextEncoder.prototype.encode = function(str){
   var out=[];
@@ -111,16 +116,21 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 // renderScript 统一用 Promise.resolve().then 收口：
 // React 的 renderToString 同步返回对象，Vue 的 renderToString 返回 Promise，两者都能接。
 // 收集 Vue 组件推入 __WF_STYLES__ 的样式并追加进 head，杜绝 SSR 首屏闪烁（FOUC）。
+// 样式来源有两处：模块加载期（SFC 顶层注入，存于 __WF_STYLES_BASE__）与渲染期
+// （组件内动态 push，存于 __WF_STYLES__），两边都要带上。
 const renderScript = `
 globalThis.__WF_OUT__ = null;
 globalThis.__WF_ERR__ = null;
 globalThis.__WF_STYLES__ = [];
 Promise.resolve(globalThis.__WF_APP__.render(globalThis.__WF_URL__, globalThis.__WF_INITIAL_PROPS__))
   .then(function(v){
-    if (v && typeof v === 'object' && Array.isArray(globalThis.__WF_STYLES__) && globalThis.__WF_STYLES__.length > 0) {
+    var base = globalThis.__WF_STYLES_BASE__ || [];
+    var cur = globalThis.__WF_STYLES__ || [];
+    var all = base.concat(cur);
+    if (v && typeof v === 'object' && all.length > 0) {
       var styleTags = '';
-      for (var i = 0; i < globalThis.__WF_STYLES__.length; i++) {
-        styleTags += '<style>' + globalThis.__WF_STYLES__[i] + '</style>';
+      for (var i = 0; i < all.length; i++) {
+        styleTags += '<style>' + all[i] + '</style>';
       }
       v.head = (v.head || '') + styleTags;
     }
@@ -149,13 +159,40 @@ func (p *Pool) RenderHTMLContext(ctx context.Context, url string, propsJSON []by
 	case vm = <-p.ch:
 	}
 
+	// 超时中断与"渲染刚好结束"存在竞态：如果渲染已经完成、VM 已经放回池子，
+	// 迟到的 Interrupt 会给一台健康 VM 打上"已中断"标记，下一个请求就会莫名失败。
+	// 这里用 CAS 状态机把两边串起来：0=渲染中，1=已结束，2=已中断。
+	var state int32
+	finished := make(chan struct{})
+	interruptDone := make(chan struct{})
+
+	go func() {
+		select {
+		case <-finished:
+		case <-ctx.Done():
+			if atomic.CompareAndSwapInt32(&state, 0, 2) {
+				vm.Interrupt("ssr render timeout")
+				close(interruptDone)
+			}
+		}
+	}()
+
 	healthy := true
 	defer func() {
 		if r := recover(); r != nil {
 			healthy = false
 			err = fmt.Errorf("ssr render panic: %v", r)
 		}
+		// 先与中断 goroutine 会合：要么确认它不会再中断（CAS 0→1 成功），
+		// 要么等它中断完（state=2），确保后续不会再碰这台 VM。
+		if atomic.CompareAndSwapInt32(&state, 0, 1) {
+			close(finished)
+		} else {
+			<-interruptDone
+		}
 		if healthy {
+			// 防御性清理：极端竞态下中断可能落在渲染收尾之后，标记会留在 VM 上。
+			vm.ClearInterrupt()
 			_, _ = vm.RunString(`delete globalThis.__WF_INITIAL_PROPS__; delete globalThis.__WF_URL__; ` +
 				`delete globalThis.__WF_OUT__; delete globalThis.__WF_ERR__; delete globalThis.__WF_STYLES__;`)
 			p.ch <- vm
@@ -165,17 +202,6 @@ func (p *Pool) RenderHTMLContext(ctx context.Context, url string, propsJSON []by
 			if createErr == nil {
 				p.ch <- newVM
 			}
-		}
-	}()
-
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			vm.Interrupt("ssr render timeout")
 		}
 	}()
 
