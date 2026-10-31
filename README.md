@@ -35,10 +35,10 @@ mux.Handle("/", engine)
 
 ```bash
 # 获取 webfront 核心运行时与编译包
-go get github.com/plunjoin/webfront@v0.0.1
+go get github.com/plunjoin/webfront@v0.1.0
 
 # 可选：安装命令行工具 wf（支持 wf install / wf build 等）
-go install github.com/plunjoin/webfront/cmd/wf@v0.0.1
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.0
 ```
 
 在 Go 代码中引用：
@@ -201,7 +201,7 @@ func main() {
 | `Dev` | `false` | 开发态标记 |
 | `EmbedFS` | `nil` | `//go:embed` 进来的产物 |
 | `DistDir` | `"dist"` | 产物在 `EmbedFS` 里的子路径，**相对 EmbedFS 根**（如 `"web/dist"`） |
-| `ServerEntry` | 自动探测 | `src/entry-server.(tsx\|ts)`（仅 `compiler.New` 构建 SSR 用） |
+| `ServerEntry` | 自动探测 | `src/entry-server.{tsx,ts,jsx,js}`，以及 Vue 约定的 `entry-server.vue.*`（仅 `compiler.New` 构建 SSR 用） |
 | `ModulesDir` | `"node_modules"` | 依赖目录名，可用 `"wf_modules"` |
 | `Renderer` | `nil` | 见下；`nil` 即静态模式 |
 | `ClientScript` | `"/assets/client.js"` | 注入页面的脚本路径（有 `EmbedFS` 时才默认注入）；设为 `"-"` 关闭 |
@@ -356,7 +356,9 @@ minify + gzip 两道下来：原始 258KB → 139KB → **45KB**（−82%），�
 
 `.vue` 单文件组件通过 esbuild 插件在构建期全自动编译：
 - **零 Node 纯 Go 编译**：通过预编译的 `*goja.Program` 字节码与常驻 VM 池调用 `@vue/compiler-sfc`，单文件编译仅需数毫秒；
+- **`<script setup lang="ts">`**：SFC 编译产物仍带类型语法，插件会自动切到 esbuild 的 TS Loader 再转译一遍；`defineProps<ImportedType>()` 也能通过内建 fs 垫片解析导入的类型文件；
 - **`<style>` 与 Scoped 样式**：自动调用 `compileStyle` 提取样式，支持 `scoped` 作用域哈希（`data-v-xxxx`）；
+- **`<style lang="scss|sass|less">`**：同样零 Node——预处理器本体（dart-sass / less 核心）从项目自己的依赖目录解析，esbuild 打成 IIFE 后在 goja 里跑，`@use` / `@import` 的文件读取由 Go 注入的回调完成，相对路径、`_partial`、`node_modules` 回退都能解析；
 - **动态 SSR 防闪烁（FOUC）**：服务端渲染时将组件样式汇集注入 HTML `<head>`，首屏即带有完整样式；
 - **开发态（Dev）实时热更与样式去重**：开发态通过 `data-wf-id` 精确覆盖样式标签，杜绝 HMR 重复堆积；修改子组件自动轻量刷新穿透原生 ESM 缓存。
 
@@ -370,15 +372,10 @@ export async function render(url: string, props: Record<string, any>) {
   return { html: await renderToString(createSSRApp(App, props)), head: '<title>Vue SSR</title>' }
 }
 ```
-// web/src/entry-server.vue.tsx
-import { createSSRApp } from 'vue'
-import { renderToString } from '@vue/server-renderer'
-import App from './App.vue'
 
-export async function render(url: string, props: Record<string, any>) {
-  return { html: await renderToString(createSSRApp(App, props)), head: '<title>Vue SSR</title>' }
-}
-```
+> **预处理器要自己装**：`<style lang="scss">` 需要项目里有 `sass`（`npm i -D sass`），`<style lang="less">` 需要 `less`，然后照常 `wf install`。没装时不会静默降级，而是报 `需要 sass：请在项目里 npm i -D sass 后执行 wf install`。首次用到时有一次约 1 秒的打包 + 字节码编译开销（之后常驻复用），单文件编译 scss ≈ 60ms、less ≈ 5ms。
+
+> `lang="stylus"`、`<template lang="pug">`、`lang="tsx"` 仍不支持（`<style src>` 也不支持，请内联）：遇到时直接报错，而不是产出坏样式/坏模块。
 
 > 开发态（`dev` 服务器）与生产构建均已完整支持 `.vue` 单文件组件编译、`<style>` / `<style scoped>` 提取与实时 HMR 热更新。
 
@@ -392,6 +389,7 @@ export async function render(url: string, props: Record<string, any>) {
 | 无流式 SSR | 不支持 `renderToPipeableStream` + Suspense | 当前全走同步 `renderToString` |
 | `ModeIslands` 尚未实现 | 孤岛水合不可用（`ModeSPA` 的文件直出 + index.html fallback 已实现） | 用 `ModeSSR` + 预渲染替代 |
 | 预渲染内容构建期固定 | 动态数据进不去 | 动态页面用 `-tags dynamic`，或客户端补 |
+| `lang="stylus"` / `lang="pug"` 无对应预处理器 | 这两类 SFC 编译不过 | 先手动编译成 css / html，或换 scss、less |
 
 ---
 
@@ -433,11 +431,20 @@ go run -tags dev . dev         # 开发服务器（改 web/src 即热更）
 
 ## 状态
 
-v0.0.1，已实现并端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.0，已实现并端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### v0.1.0 相对 v0.0.1
+
+- **`<script setup lang="ts">` 真正转译**：SFC 产物按 `lang` 切 esbuild Loader，`defineProps<ImportedType>()` 与模板里的 `x as T` 一并支持
+- **CSS 预处理器**：`<style lang="scss|sass|less">` 零 Node 编译（dart-sass / less 核心跑在 goja 里，`@use` / `@import` 的文件读取交给 Go）
+- **入口自动探测**：`entry-server.{tsx,ts,jsx,js}` / `entry-client.*` / `main.*`，含 Vue 约定的 `entry-server.vue.*`
+- **dev server**：递归监听新建目录、`.vue` 的 TS / scss 实时转译、静态资源路径穿越防护
+- **修复**：SSR 首屏样式丢失（模块加载期样式被重置）、goja `Interrupt` 与 VM 归池的竞态、预渲染 CSS 注入与 `-base` 前缀、`wf install` 解压路径穿越
+- **测试入库**：`.gitignore` 不再忽略 `*_test.go`
 
 设计与取舍见 [ARCHITECTURE.md](ARCHITECTURE.md)。
