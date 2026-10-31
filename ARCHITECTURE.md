@@ -80,6 +80,8 @@ webfront/
 │   ├── goja.go            Pool + 宿主 shim + 微任务收口
 │   └── quote.go           JS 字符串字面量转义
 ├── dev/                 开发态：esbuild Transform + fsnotify + WS HMR
+│   ├── dev.go            DevServer：按需转译 / @deps / WebSocket
+│   └── supervisor.go     wf dev：进程级热重载（重编译 + 换进程 + 探活）
 ├── cmd/wf/              极薄 CLI
 ├── _examples/basic/     三形态示例（build tag 切换）+ 前端工程 web/
                          （`_` 前缀：Go 工具链跳过，`go build ./...` 不受示例影响）
@@ -562,6 +564,7 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 | `GET /src/*` | 读源文件 → `esbuild.Transform`（毫秒级）→ 返回 ESM |
 | `GET /@deps/*` | 按需打包 npm 裸模块为 ESM 并内存缓存（配合 ImportMap 极速裸导入） |
 | `GET /__wf_hmr` | 升级 WebSocket，推送变更事件 |
+| `GET /__wf_ping` | 204 + `no-store`；Go 进程重启期间浏览器靠它判断"服务回来了没有" |
 
 按需单文件转译的类型支持：
 
@@ -586,6 +589,43 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 **Windows 上的坑**：编辑器"改名式保存"（写 `.tmp` 再 rename）会先发 `Remove` 再发 `Create`。若在 `Remove` 时就广播，浏览器 `import()` 会撞上文件短暂不存在的 404。因此只监听 `Write|Create`，跳过 `Remove|Rename|Chmod`。
 
+### 7.3 Go 侧热重载：Supervise（supervisor.go）
+
+Go 没有热替换：进程里的机器码换不掉，`plugin` 只在 Linux 上可用且不能卸载。所以
+"Go HMR"只能是**重编译 + 换进程**，工程上真正要解决的是"换得没有存在感"。
+
+`wf dev` 的时序：
+
+```
+文件变更（fsnotify：*.go / go.mod / go.sum）
+      │  debounce 120ms
+      ▼
+   go build -o <tmp>/app-<n>.exe .        ← 旧进程继续服务
+      │
+      ├─ 失败 → 打印编译器错误，保留旧进程，回到监听
+      ▼ 成功
+   kill 旧进程 → wait → 删掉旧二进制
+      ▼
+   启动新进程（继承 stdout/stderr，注入 WF_DEV=1）
+```
+
+四个关键取舍：
+
+1. **先编译、后杀进程**。反过来会把一次语法错误变成"页面打不开"，这是开发体验最差的一步。
+2. **每次编译到新的临时文件**。Windows 下运行中的 exe 不能覆盖、也不能改名；进程退出后立刻删，长时间开发不会堆出几十个 10MB 的二进制。
+3. **`Remove` / `Rename` 也要响应**——和前端 HMR 正好相反：前端删文件不影响已加载的模块，而删掉一个 `.go` 会改变编译结果。
+4. **子进程退出不终止监听**。panic / 端口占用之后，改好代码就能自动拉起，不用重开终端。
+
+浏览器侧的配合：
+
+| 环节 | 行为 |
+| --- | --- |
+| WebSocket 断开 | 600ms 后盖上覆盖层"后端重启中"（实测重启只有 300~500ms，太早弹层会闪） |
+| 恢复探测 | 每 300ms `fetch('/__wf_ping')`；只把**网络错误**当作"还没起来" |
+| 服务回来 | `location.reload()`，拿到新编译的后端与新 importmap |
+
+用"任何 HTTP 响应都算活"而不是"必须 200"，是为了让自定义 404 页 / 反向代理下的应用也能正常恢复。
+
 ---
 
 ## 8. CLI 与构建矩阵
@@ -595,12 +635,14 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 ```bash
 wf build   [-modules <dir>] [-split=true] [-prerender routes.json] [rootDir]
 wf install [-modules <dir>] [rootDir]
+wf dev     [-tags dev] [-run "dev"] [-watch <dir>] [-ldflags "..."] [appDir]
 ```
 
 - `-split`（默认 `true`）：客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE。
 - `-prerender`：读 `routes.json`，额外产出 `dist/pages/*.html`，运行期可零引擎。
 - `-modules`：依赖目录名，默认 `node_modules`（示例用 `wf_modules`）。非 `node_modules` 时自动作为 esbuild 的 `NodePaths`（等价 `NODE_PATH` 语义）。
 - `rootDir`：指**包含 `web/` 的目录**；直接指向 `web/` 目录也能用（两个子命令走同一套归一化，见 `webDirOf`）。
+- `wf dev`：`appDir` 是要构建的 main 包；`-tags` 默认 `dev`、`-run` 默认 `dev`（即 `go run -tags dev . dev` 的等价物），`-watch` 默认取 `go.mod` 所在目录。它只负责"重编译 + 换进程"，前端 HMR 仍由应用内的 `dev.DevServer` 提供。
 
 ### 8.2 build tag 矩阵
 
@@ -608,7 +650,7 @@ wf install [-modules <dir>] [rootDir]
 | --- | --- | --- |
 | 静态 | `go build .` | `engine_static.go`（`!dynamic`），不 import jsruntime |
 | 动态 | `go build -tags dynamic .` | `engine_dynamic.go` + `jsruntime/goja.go` |
-| 开发 | `go run -tags dev . dev` | `dev_mode.go`；`dev_stub.go`（`!dev`）保证生产二进制无 esbuild |
+| 开发 | `wf dev`（或 `go run -tags dev . dev`） | `dev_mode.go`；`dev_stub.go`（`!dev`）保证生产二进制无 esbuild |
 
 三种组合均已 `go build` + `go vet` 通过。
 
@@ -679,6 +721,7 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 | 7 | 🟢 已解 | ~~**`ModeSPA` 仅占位**~~ | 已完整实现：静态资源直出 + `EmbedFS` 的 `index.html` History 路由 fallback 机制，单测通过。 |
 | 8 | 🟢 低 | **（使用侧）Gin `*` 模式不匹配裸前缀** | 这是 Gin 的行为不是库的问题：`r.Any("/admin/*filepath")` 不含 `/admin`，需补精确路由或建 group。 |
 | 9 | 🟢 低 | **未用 `-race` 检测** | `-race` 要求 cgo，与零 CGO 铁律冲突。并发安全靠"池单 VM 单 goroutine"语义保证，已用 4 VM / 500 请求压测零串台。 |
+| 10 | 🟢 低 | **`wf dev` 的 Go 热更是重启进程** | Go 无法热替换机器码，重启窗口（2–3s）内请求会失败。只用于开发；线上靠多副本滚动更新，不依赖它。 |
 
 ---
 

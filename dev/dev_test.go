@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/evanw/esbuild/pkg/api"
+
 	"github.com/plunjoin/webfront/compiler"
 )
 
@@ -80,5 +83,48 @@ func TestDevServerImportMapAndDeps(t *testing.T) {
 	handler.ServeHTTP(wDep2, reqDep)
 	if wDep2.Code != http.StatusOK {
 		t.Fatalf("expected 200 on cached dep, got %d", wDep2.Code)
+	}
+}
+
+// TestDevIndexClientScript 保证注入浏览器的 HMR 脚本本身是合法 JS，
+// 并且带上了"后端重启后自动重载"的能力（wf dev 依赖它）。
+func TestDevIndexClientScript(t *testing.T) {
+	ds := &DevServer{entry: "/src/main.tsx", rootDeps: map[string]string{}}
+	h := ds.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	html := rec.Body.String()
+
+	const open = "<script>\n"
+	start := strings.Index(html, open)
+	if start < 0 {
+		t.Fatalf("index 里找不到内联脚本:\n%s", html)
+	}
+	rest := html[start+len(open):]
+	end := strings.Index(rest, "</script>")
+	if end < 0 {
+		t.Fatalf("内联脚本没有闭合:\n%s", html)
+	}
+	script := rest[:end]
+
+	// 用 esbuild 当 JS 解析器：模板字符串拼错会在这里暴露，而不是等到浏览器白屏。
+	if res := api.Transform(script, api.TransformOptions{Loader: api.LoaderJS}); len(res.Errors) > 0 {
+		t.Fatalf("HMR 客户端脚本有语法错误: %+v\n%s", res.Errors, script)
+	}
+	for _, want := range []string{"/__wf_ping", "location.reload()", "showOverlay", "wss://"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("HMR 脚本缺少 %q", want)
+		}
+	}
+
+	// 探活端点必须够轻：204 + 不缓存
+	pr := httptest.NewRecorder()
+	h.ServeHTTP(pr, httptest.NewRequest(http.MethodGet, "/__wf_ping", nil))
+	if pr.Code != http.StatusNoContent {
+		t.Fatalf("/__wf_ping 期望 204，实际 %d", pr.Code)
+	}
+	if got := pr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("/__wf_ping Cache-Control = %q，期望 no-store", got)
 	}
 }

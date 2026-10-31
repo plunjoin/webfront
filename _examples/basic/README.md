@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 预渲染静态（SSG） | `go build .` | 6.89 MB | 不链接 JS 引擎，只发预生成的 HTML |
 | 动态 SSR | `go build -tags dynamic .` | 15.62 MB | 带 goja，每请求实时渲染 |
-| 开发服务器 | `go run -tags dev . dev` | 11.36 MB | esbuild 单文件转译 + WebSocket HMR |
+| 开发服务器 | `wf dev`（或 `go run -tags dev . dev`） | 11.36 MB | esbuild 单文件转译 + WebSocket HMR；改 `.go` 自动重启 |
 
 ## 先构建前端产物
 
@@ -33,6 +33,10 @@ go run -tags dev . dev                                 # 开发模式（改 web/
 
 ./app.exe    # → http://localhost:8080
 ```
+
+开发时更推荐 `wf dev`（在仓库根执行 `go run ./cmd/wf dev ./_examples/basic`）：
+它比 `go run -tags dev . dev` 多了一层——**改 `.go` 会自动重新编译并重启进程**，
+浏览器在重启完成后自己刷新，不用手动 Ctrl-C 再起一次。
 
 > 忘了先构建产物也不会崩：程序启动时会提示缺哪一步，`/` 返回 404。
 

@@ -10,6 +10,6 @@ import (
 
 func runDev() {
 	fmt.Println("这是生产构建（不含开发服务器）。")
-	fmt.Println("开发模式请用：go run -tags dev . dev")
+	fmt.Println("开发模式请用：wf dev（或 go run -tags dev . dev）")
 	os.Exit(1)
 }
