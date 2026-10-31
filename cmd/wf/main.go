@@ -52,17 +52,16 @@ func main() {
 			os.Exit(1)
 		}
 
-		clientEntry := "src/entry-client.tsx"
-		if _, err := os.Stat(filepath.Join(webDir, clientEntry)); err != nil {
-			if _, err := os.Stat(filepath.Join(webDir, "src", "main.tsx")); err == nil {
-				clientEntry = "src/main.tsx"
-			}
+		clientEntry := compiler.DetectClientEntry(webDir)
+		if clientEntry == "" {
+			fmt.Println("✗ 找不到客户端入口（src/entry-client.tsx / src/main.tsx …）")
+			os.Exit(1)
 		}
 
 		// 1) SSR bundle（喂给 goja VM 池；若指定 -mode spa 或无 entry-server 则跳过）
 		hasServer := *mode != "spa"
-		serverEntry := "src/entry-server.tsx"
-		if _, err := os.Stat(filepath.Join(webDir, serverEntry)); err != nil {
+		serverEntry := compiler.DetectServerEntry(webDir)
+		if serverEntry == "" {
 			hasServer = false
 		}
 
@@ -152,7 +151,7 @@ func main() {
 				fmt.Println("✗ read routes:", err)
 				os.Exit(1)
 			}
-			files, err := compiler.Prerender(ssr, routes, distDir, prefix+"/assets/client.js")
+			files, err := compiler.PrerenderWithBase(ssr, routes, distDir, prefix+"/assets/client.js", prefix)
 			if err != nil {
 				fmt.Println("✗ prerender:", err)
 				os.Exit(1)

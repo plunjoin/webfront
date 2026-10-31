@@ -4,6 +4,8 @@ package compiler
 // 生产部署不需要它（直接 webfront.New + 嵌入 ssr.js），开发/单机自编译时用它。
 
 import (
+	"fmt"
+
 	"github.com/plunjoin/webfront"
 	"github.com/plunjoin/webfront/jsruntime"
 )
@@ -14,9 +16,15 @@ import (
 // webfront.Config 里，因为只有这里才真正创建引擎池 —— 核心包不 import jsruntime，
 // 也就无从决定池大小（早先放在 Config 里是个误导性的死字段）。
 func New(cfg webfront.Config, vmPoolSize int) (*webfront.Engine, error) {
+	if cfg.RootDir == "" {
+		cfg.RootDir = "./web"
+	}
 	entry := cfg.ServerEntry
 	if entry == "" {
-		entry = "src/entry-server.tsx"
+		entry = DetectServerEntry(cfg.RootDir)
+		if entry == "" {
+			return nil, fmt.Errorf("webfront: 在 %s 下找不到 SSR 入口（src/entry-server.tsx / .ts / .vue.tsx …）", cfg.RootDir)
+		}
 	}
 	b, err := BuildSSRWith(cfg.RootDir, entry, cfg.ModulesDir)
 	if err != nil {

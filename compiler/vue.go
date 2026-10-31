@@ -10,8 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	gopath "path"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +43,73 @@ const nodeStub = `globalThis.global=globalThis;` +
 	`if(p==='toString')return function(){return '';};` +
 	`return __wfStub();},apply:function(){return __wfStub();},` +
 	`construct:function(){return __wfStub();}});}` +
-	`globalThis.require=function(){return __wfStub();};`
+	// path 不能走 __wfStub：@vue/compiler-sfc 解析 defineProps 的导入类型时要真算目录。
+	// 这里用 Proxy 延迟到调用时再取 globalThis.__wfPath（由 Go 侧注入 filepath 实现）。
+	`var __wfPathProxy=new Proxy({},{get:function(t,p){` +
+	`if(typeof p!=='string')return undefined;` +
+	`var target=globalThis.__wfPath;var v=target?target[p]:undefined;` +
+	`if(typeof v==='function')return function(){return v.apply(target,arguments);};` +
+	`return v;}});` +
+	`globalThis.require=function(n){if(n==='path'||n==='node:path')return __wfPathProxy;return __wfStub();};`
+
+// installNodeShims 给 VM 注入 Node 的 path 模块（filepath 语义）。
+// @vue/compiler-sfc 解析 defineProps 的导入类型时会调用 path.dirname / join / posix.*，
+// 走通用 stub 只会得到空串，最终报 "Failed to resolve import source"。
+func installNodeShims(vm *goja.Runtime) {
+	strFn := func(fn func(string) string) func(goja.FunctionCall) goja.Value {
+		return func(call goja.FunctionCall) goja.Value {
+			return vm.ToValue(fn(call.Argument(0).String()))
+		}
+	}
+	joinFn := func(join func(...string) string) func(goja.FunctionCall) goja.Value {
+		return func(call goja.FunctionCall) goja.Value {
+			parts := make([]string, 0, len(call.Arguments))
+			for _, a := range call.Arguments {
+				parts = append(parts, a.String())
+			}
+			return vm.ToValue(join(parts...))
+		}
+	}
+	absFn := func(join func(...string) string, forceSlash bool) func(goja.FunctionCall) goja.Value {
+		return func(call goja.FunctionCall) goja.Value {
+			parts := make([]string, 0, len(call.Arguments))
+			for _, a := range call.Arguments {
+				parts = append(parts, a.String())
+			}
+			p := join(parts...)
+			if !forceSlash {
+				if abs, err := filepath.Abs(p); err == nil {
+					p = abs
+				}
+			} else if !strings.HasPrefix(p, "/") {
+				p = "/" + p
+			}
+			return vm.ToValue(p)
+		}
+	}
+
+	p := vm.NewObject()
+	_ = p.Set("dirname", strFn(filepath.Dir))
+	_ = p.Set("basename", strFn(filepath.Base))
+	_ = p.Set("extname", strFn(filepath.Ext))
+	_ = p.Set("join", joinFn(filepath.Join))
+	_ = p.Set("resolve", absFn(filepath.Join, false))
+	_ = p.Set("isAbsolute", func(call goja.FunctionCall) goja.Value {
+		return vm.ToValue(filepath.IsAbs(call.Argument(0).String()))
+	})
+	_ = p.Set("sep", string(filepath.Separator))
+
+	posix := vm.NewObject()
+	_ = posix.Set("dirname", strFn(gopath.Dir))
+	_ = posix.Set("basename", strFn(gopath.Base))
+	_ = posix.Set("extname", strFn(gopath.Ext))
+	_ = posix.Set("join", joinFn(gopath.Join))
+	_ = posix.Set("resolve", absFn(gopath.Join, true))
+	_ = posix.Set("sep", "/")
+	_ = p.Set("posix", posix)
+
+	_ = vm.Set("__wfPath", p)
+}
 
 func createCompilerInstance(rootDir, modulesDir string) (*compilerInstance, error) {
 	abs, _ := filepath.Abs(rootDir)
@@ -154,6 +220,7 @@ func getCompilerVM(rootDir, modulesDir string) (*goja.Runtime, func(), error) {
 	case vm = <-inst.compilerPool:
 	default:
 		vm = goja.New()
+		installNodeShims(vm)
 		if _, err := vm.RunProgram(inst.stubProg); err != nil {
 			return nil, nil, fmt.Errorf("node globals shim: %w", err)
 		}
@@ -166,7 +233,7 @@ func getCompilerVM(rootDir, modulesDir string) (*goja.Runtime, func(), error) {
 		if vm == nil {
 			return
 		}
-		_, _ = vm.RunString(`delete globalThis.__d; delete globalThis.__s; delete globalThis.__t; delete globalThis.__css; delete globalThis.__scopeId; delete globalThis.__hasScoped;`)
+		_, _ = vm.RunString(`delete globalThis.__d; delete globalThis.__s; delete globalThis.__t; delete globalThis.__css; delete globalThis.__scopeId; delete globalThis.__serr; delete globalThis.__wfStyles;`)
 		select {
 		case inst.compilerPool <- vm:
 		default:
@@ -191,14 +258,70 @@ func isNodeBuiltin(p string) bool {
 	return false
 }
 
+// SFCResult 是 .vue 单文件组件的编译产物。
+type SFCResult struct {
+	// Code 是编译出的 ESM 模块源码。注意：脚本声明 lang="ts" 时，产物里仍然
+	// 带着类型注解（interface / ref<number>() / setup(__props: any) …），
+	// 必须再按 TS 转译一次，才能交给 esbuild / 浏览器 / goja。
+	Code string
+	// Lang 是 <script> / <script setup> 声明的语言（"" / "js" / "ts"）。
+	Lang string
+}
+
+// SFCLoader 把 SFC 脚本语言映射成 esbuild 的 Loader。
+// @vue/compiler-sfc 只负责"SFC 语法"这一层，并不擦除 TS 类型；
+// 产物必须用 LoaderTS 再过一遍，否则会在 `interface`、`x as T` 处直接语法报错。
+func SFCLoader(lang string) api.Loader {
+	if strings.EqualFold(lang, "ts") {
+		return api.LoaderTS
+	}
+	return api.LoaderJS
+}
+
+// sfcStyle 是一个 <style> 块的元信息（内容在预处理后会被替换成纯 CSS）。
+type sfcStyle struct {
+	Lang    string `json:"lang"`
+	Content string `json:"content"`
+	Scoped  bool   `json:"scoped"`
+	Src     string `json:"src"`
+}
+
+// sfcMeta 是 parse 之后从 descriptor 里提取的元信息。
+type sfcMeta struct {
+	Errors          []string   `json:"errors"`
+	ScriptLang      string     `json:"scriptLang"`
+	ScriptSetupLang string     `json:"scriptSetupLang"`
+	TemplateLang    string     `json:"templateLang"`
+	Styles          []sfcStyle `json:"styles"`
+	HasScoped       bool       `json:"hasScoped"`
+	ScriptSrc       string     `json:"scriptSrc"`
+}
+
 // CompileSFC 用 goja 内嵌的 @vue/compiler-sfc 编译单个 .vue 源为 JS 模块。
-// 支持 <template>、<script>、<style scoped>/<style> 自动提取并注入 DOM，复用常驻 VM 池。
+// 支持 <template>、<script>、<script setup lang="ts">、<style scoped>/<style>，
+// 自动提取样式并注入 DOM，复用常驻 VM 池。
+//
+// 注意：脚本声明 lang="ts" 时，返回值里仍带 TS 语法，调用方必须再按 TS 转译一次；
+// 需要语言信息请用 CompileSFCResult + SFCLoader。
 func CompileSFC(rootDir, modulesDir, source, filename string) (string, error) {
+	res, err := CompileSFCResult(rootDir, modulesDir, source, filename)
+	return res.Code, err
+}
+
+// CompileSFCResult 同 CompileSFC，但额外返回脚本语言，供调用方选择 esbuild Loader。
+//
+// 支持的 <style lang>：css / scss / sass / less。预处理器按需从项目依赖目录加载
+// （见 preprocess.go），没装对应包时会在用到的那一刻报出明确指引。
+func CompileSFCResult(rootDir, modulesDir, source, filename string) (SFCResult, error) {
 	vm, cleanup, err := getCompilerVM(rootDir, modulesDir)
 	if err != nil {
-		return "", err
+		return SFCResult{}, err
 	}
 	defer cleanup()
+
+	// 统一成正斜杠：@vue/compiler-sfc 的浏览器版内置的是 POSIX 风格 path 垫片，
+	// Windows 反斜杠会让 path.dirname 失效，进而解析不了 defineProps 的导入类型。
+	filename = filepath.ToSlash(filename)
 
 	hashBytes := sha256.Sum256([]byte(filename))
 	scopeId := "data-v-" + fmt.Sprintf("%x", hashBytes)[:8]
@@ -206,78 +329,188 @@ func CompileSFC(rootDir, modulesDir, source, filename string) (string, error) {
 	// 1) parse
 	if _, err := vm.RunString("globalThis.__d = compilerSfc.parse(" +
 		strconv.Quote(source) + ", { filename: " + strconv.Quote(filename) + " });"); err != nil {
-		return "", fmt.Errorf("parse: %w", err)
+		return SFCResult{}, fmt.Errorf("%s: parse: %w", filename, err)
 	}
 
-	// 2) check scoped styles
-	checkScoped := `
-var descriptor = globalThis.__d.descriptor;
-var hasScoped = false;
-if (descriptor.styles && descriptor.styles.length > 0) {
-  for (var i = 0; i < descriptor.styles.length; i++) {
-    if (descriptor.styles[i].scoped) { hasScoped = true; break; }
+	// 2) 元信息：解析错误、脚本/模板/样式语言、是否 scoped
+	metaJS := `
+(function () {
+  var d = globalThis.__d, desc = d.descriptor;
+  function msg(e) {
+    var m = (e && e.message) ? e.message : String(e);
+    if (e && e.loc && e.loc.start) { m += ' (' + e.loc.start.line + ':' + e.loc.start.column + ')'; }
+    return m;
   }
-}
-globalThis.__hasScoped = hasScoped;
-`
-	if _, err := vm.RunString(checkScoped); err != nil {
-		return "", fmt.Errorf("checkScoped: %w", err)
+  return JSON.stringify({
+    errors: (d.errors || []).map(msg),
+    scriptLang: (desc.script && desc.script.lang) || '',
+    scriptSetupLang: (desc.scriptSetup && desc.scriptSetup.lang) || '',
+    templateLang: (desc.template && desc.template.lang) || '',
+    styles: (desc.styles || []).map(function (s) {
+      return { lang: s.lang || '', content: s.content || '', scoped: !!s.scoped, src: s.src || '' };
+    }),
+    hasScoped: (desc.styles || []).some(function (s) { return !!s.scoped; }),
+    scriptSrc: (desc.script && desc.script.src) || (desc.scriptSetup && desc.scriptSetup.src) || ''
+  });
+})()`
+	metaVal, err := vm.RunString(metaJS)
+	if err != nil {
+		return SFCResult{}, fmt.Errorf("%s: 读取 SFC 元信息: %w", filename, err)
 	}
+	var meta sfcMeta
+	if err := json.Unmarshal([]byte(metaVal.String()), &meta); err != nil {
+		return SFCResult{}, fmt.Errorf("%s: 解析 SFC 元信息: %w", filename, err)
+	}
+	if len(meta.Errors) > 0 {
+		return SFCResult{}, fmt.Errorf("%s: %s", filename, strings.Join(meta.Errors, "; "))
+	}
+	if meta.ScriptSrc != "" {
+		return SFCResult{}, fmt.Errorf("%s: 暂不支持 <script src=%q>，请把脚本内联进 SFC", filename, meta.ScriptSrc)
+	}
+	if meta.TemplateLang != "" && !strings.EqualFold(meta.TemplateLang, "html") {
+		return SFCResult{}, fmt.Errorf("%s: 暂不支持 <template lang=%q>（纯 Go 编译链没有模板预处理器）", filename, meta.TemplateLang)
+	}
+	// <style> 只支持内联的 css / scss / sass / less（预处理器见 preprocess.go）。
+	for _, st := range meta.Styles {
+		if st.Src != "" {
+			return SFCResult{}, fmt.Errorf("%s: 暂不支持 <style src=%q>，请把样式内联进 SFC", filename, st.Src)
+		}
+		if _, ok := preprocessKind(st.Lang); !ok {
+			return SFCResult{}, fmt.Errorf("%s: <style lang=%q> 暂不支持（可用：css / scss / sass / less）", filename, st.Lang)
+		}
+	}
+	lang := meta.ScriptSetupLang
+	if lang == "" {
+		lang = meta.ScriptLang
+	}
+	if lang != "" && !strings.EqualFold(lang, "js") && !strings.EqualFold(lang, "ts") {
+		return SFCResult{}, fmt.Errorf("%s: 暂不支持 <script lang=%q>（只支持 js / ts）", filename, lang)
+	}
+	isTS := strings.EqualFold(lang, "ts")
 
 	// 3) compileScript
+	// genDefaultAs 让 <script setup> 直接产出 `const __script = ...`，不必再用正则
+	// 替换 `export default`（那种做法会误伤字符串/注释里的同名字样）。
+	// 普通 <script> 没有 setup 时 compileScript 原样返回内容，用官方 rewriteDefault 改写。
+	//
+	// fs 必须自己提供：`defineProps<ImportedType>()` 需要读被导入的类型文件，
+	// 否则 @vue/compiler-sfc 会报 "No fs option provided ... non-Node environment"。
+	_ = vm.Set("__wfFileExists", func(call goja.FunctionCall) goja.Value {
+		_, statErr := os.Stat(call.Argument(0).String())
+		return vm.ToValue(statErr == nil)
+	})
+	_ = vm.Set("__wfReadFile", func(call goja.FunctionCall) goja.Value {
+		b, readErr := os.ReadFile(call.Argument(0).String())
+		if readErr != nil {
+			return goja.Undefined()
+		}
+		return vm.ToValue(string(b))
+	})
+	_ = vm.Set("__wfRealpath", func(call goja.FunctionCall) goja.Value {
+		p, absErr := filepath.Abs(call.Argument(0).String())
+		if absErr != nil {
+			return vm.ToValue(call.Argument(0).String())
+		}
+		return vm.ToValue(p)
+	})
+
+	parserPlugins := "[]"
+	if isTS {
+		parserPlugins = "['typescript']"
+	}
 	compileScriptCall := fmt.Sprintf(`
-if (globalThis.__d.descriptor.script || globalThis.__d.descriptor.scriptSetup) {
-  globalThis.__s = compilerSfc.compileScript(globalThis.__d.descriptor, { id: %s });
-} else {
-  globalThis.__s = { content: 'export default {}', bindings: {} };
-}
-`, strconv.Quote(scopeId))
+(function () {
+  var desc = globalThis.__d.descriptor;
+  if (!desc.script && !desc.scriptSetup) {
+    globalThis.__s = { content: 'const __script = {};', bindings: {} };
+    return;
+  }
+  var opts = {
+    id: %s,
+    fs: {
+      fileExists: globalThis.__wfFileExists,
+      readFile: globalThis.__wfReadFile,
+      realpath: globalThis.__wfRealpath
+    }
+  };
+  if (desc.scriptSetup) { opts.genDefaultAs = '__script'; }
+  var s = compilerSfc.compileScript(desc, opts);
+  if (!desc.scriptSetup) {
+    s.content = compilerSfc.rewriteDefault(s.content, '__script', %s);
+  }
+  globalThis.__s = s;
+})();`, strconv.Quote(scopeId), parserPlugins)
 	if _, err := vm.RunString(compileScriptCall); err != nil {
-		return "", fmt.Errorf("compileScript: %w", err)
+		return SFCResult{}, fmt.Errorf("%s: compileScript: %w", filename, err)
 	}
 
 	// 4) compileTemplate（仅当有 <template>）
+	// isTS 必须透传：compiler-core 只有在 options.isTS 为真时才会给模板表达式
+	// 加上 babel 的 typescript 插件，否则 {{ x as string }} 这类写法编译不过。
 	tmplCall := fmt.Sprintf(`
-if (globalThis.__d.descriptor.template && globalThis.__d.descriptor.template.content) {
+(function () {
+  var desc = globalThis.__d.descriptor;
+  if (!desc.template || !desc.template.content) { globalThis.__t = null; return; }
+  var co = {
+    scopeId: %t ? %s : undefined,
+    bindingMetadata: globalThis.__s.bindings
+  };
+  if (%t) { co.isTS = true; co.expressionPlugins = ['typescript']; }
   globalThis.__t = compilerSfc.compileTemplate({
-    source: globalThis.__d.descriptor.template.content,
+    source: desc.template.content,
     filename: %s,
     id: %s,
-    scoped: globalThis.__hasScoped,
-    compilerOptions: {
-      scopeId: globalThis.__hasScoped ? %s : undefined,
-      bindingMetadata: globalThis.__s.bindings
-    }
+    scoped: %t,
+    compilerOptions: co
   });
-} else {
-  globalThis.__t = null;
-}
-`, strconv.Quote(filename), strconv.Quote(scopeId), strconv.Quote(scopeId))
+})();`, meta.HasScoped, strconv.Quote(scopeId), isTS, strconv.Quote(filename), strconv.Quote(scopeId), meta.HasScoped)
 	if _, err := vm.RunString(tmplCall); err != nil {
-		return "", fmt.Errorf("compileTemplate: %w", err)
+		return SFCResult{}, fmt.Errorf("%s: compileTemplate: %w", filename, err)
+	}
+	if tv, err := vm.RunString(`(globalThis.__t && globalThis.__t.errors) ? globalThis.__t.errors.map(function (e) { return (e && e.message) ? e.message : String(e); }).join('; ') : ''`); err == nil && tv != nil && tv.String() != "" {
+		return SFCResult{}, fmt.Errorf("%s: %s", filename, tv.String())
 	}
 
-	// 5) compileStyle（提取并编译 <style>）
+	// 5) 预处理 <style lang="scss|sass|less">：先转成纯 CSS，再交给 compileStyle。
+	// 分两步走是为了让 compileStyle 只负责 SFC 语义（scoped / :deep() / v-bind()），
+	// 预处理器则跑在独立的 VM 里 —— 两者的全局环境互不污染。
+	styles := make([]sfcStyle, 0, len(meta.Styles))
+	for _, st := range meta.Styles {
+		css, perr := preprocessStyle(rootDir, modulesDir, st.Lang, st.Content, filename)
+		if perr != nil {
+			return SFCResult{}, fmt.Errorf("%s: <style>: %w", filename, perr)
+		}
+		st.Content = css
+		styles = append(styles, st)
+	}
+	stylesJSON, _ := json.Marshal(styles)
+	if _, err := vm.RunString("globalThis.__wfStyles = JSON.parse(" + strconv.Quote(string(stylesJSON)) + ");"); err != nil {
+		return SFCResult{}, fmt.Errorf("%s: 注入 <style> 内容: %w", filename, err)
+	}
+
+	// 6) compileStyle（scoped 变换 + 汇总）
 	compileStylesCall := fmt.Sprintf(`
-var css = '';
-if (globalThis.__d.descriptor.styles && globalThis.__d.descriptor.styles.length > 0) {
-  for (var i = 0; i < globalThis.__d.descriptor.styles.length; i++) {
-    var s = globalThis.__d.descriptor.styles[i];
-    var res = compilerSfc.compileStyle({
-      source: s.content,
-      id: %s,
-      scoped: !!s.scoped,
-      filename: %s
-    });
-    if (res.code) {
-      css += res.code + '\n';
+(function () {
+  var list = globalThis.__wfStyles || [], css = '', errs = [];
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i];
+    var res = compilerSfc.compileStyle({ source: s.content, id: %s, scoped: !!s.scoped, filename: %s });
+    if (res.code) { css += res.code + '\n'; }
+    if (res.errors) {
+      for (var j = 0; j < res.errors.length; j++) {
+        var e = res.errors[j];
+        errs.push((e && e.message) ? e.message : String(e));
+      }
     }
   }
-}
-globalThis.__css = css;
-`, strconv.Quote(scopeId), strconv.Quote(filename))
+  globalThis.__css = css;
+  globalThis.__serr = errs.join('; ');
+})();`, strconv.Quote(scopeId), strconv.Quote(filename))
 	if _, err := vm.RunString(compileStylesCall); err != nil {
-		return "", fmt.Errorf("compileStyle: %w", err)
+		return SFCResult{}, fmt.Errorf("%s: compileStyle: %w", filename, err)
+	}
+	if sv, err := vm.RunString(`globalThis.__serr || ''`); err == nil && sv != nil && sv.String() != "" {
+		return SFCResult{}, fmt.Errorf("%s: <style>: %s", filename, sv.String())
 	}
 
 	var tmpl, script, css string
@@ -290,26 +523,20 @@ globalThis.__css = css;
 	if cv, err := vm.RunString(`globalThis.__css || ''`); err == nil && cv != nil {
 		css = cv.String()
 	}
-	hasScopedVal := vm.Get("__hasScoped")
-	hasScoped := hasScopedVal != nil && hasScopedVal.ToBoolean()
 
 	// 组合为单模块：模板提供 render，脚本提供组件选项，样式按需注入 DOM
 	if tmpl != "" {
 		tmpl = strings.Replace(tmpl, "export function render", "function render", 1)
 	}
-	if strings.Contains(script, "export default") {
-		script = regexp.MustCompile(`export\s+default\s*`).ReplaceAllString(script, "const __script = ")
-	} else if strings.TrimSpace(script) == "" {
+	if strings.TrimSpace(script) == "" {
 		script = "const __script = {};"
-	} else {
-		script = script + "\nconst __script = {};"
 	}
 
 	var extra strings.Builder
 	if tmpl != "" {
 		extra.WriteString("__script.render = render;\n")
 	}
-	if hasScoped {
+	if meta.HasScoped {
 		extra.WriteString(fmt.Sprintf("__script.__scopeId = %s;\n", strconv.Quote(scopeId)))
 	}
 	if strings.TrimSpace(css) != "" {
@@ -335,7 +562,7 @@ globalThis.__css = css;
 		out += tmpl + "\n"
 	}
 	out += script + "\n" + extra.String()
-	return out, nil
+	return SFCResult{Code: out, Lang: strings.ToLower(lang)}, nil
 }
 
 func compileSFC(rootDir, modulesDir, source, filename string) (string, error) {
@@ -352,11 +579,13 @@ func VuePlugin(rootDir, modulesDir string) api.Plugin {
 				if err != nil {
 					return api.OnLoadResult{}, err
 				}
-				code, err := CompileSFC(rootDir, modulesDir, string(src), args.Path)
+				res, err := CompileSFCResult(rootDir, modulesDir, string(src), args.Path)
 				if err != nil {
 					return api.OnLoadResult{}, err
 				}
-				return api.OnLoadResult{Contents: &code, Loader: api.LoaderJS}, nil
+				// lang="ts" 的产物仍含 TS 语法，交给 esbuild 的 TS Loader 擦除类型；
+				// 普通 JS 走 LoaderJS，保持原有行为。
+				return api.OnLoadResult{Contents: &res.Code, Loader: SFCLoader(res.Lang)}, nil
 			})
 		},
 	}
