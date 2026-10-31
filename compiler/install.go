@@ -12,6 +12,7 @@ package compiler
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha512"
 	"encoding/base64"
@@ -280,7 +281,7 @@ func verifyIntegrity(body []byte, integrity string) error {
 
 // extractTarball 解压 npm tarball（gzip + tar，顶层 "package/" 需剥离）。
 func extractTarball(body []byte, dest string) error {
-	gz, err := gzip.NewReader(strings.NewReader(string(body)))
+	gz, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -295,10 +296,23 @@ func extractTarball(body []byte, dest string) error {
 			return err
 		}
 		name := strings.TrimPrefix(hdr.Name, "package/")
+		name = filepath.ToSlash(name)
 		if name == "" {
 			continue
 		}
-		out := filepath.Join(dest, name)
+		// 防目录穿越：tarball 里的绝对路径 / ".." 不能落到 dest 之外。
+		clean := filepath.Clean(filepath.FromSlash(name))
+		if clean == "." {
+			continue
+		}
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("tarball contains unsafe path: %q", hdr.Name)
+		}
+		// 符号链接/硬链接一律不落盘：npm 包用不到，且可能指向包外。
+		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+			continue
+		}
+		out := filepath.Join(dest, clean)
 		if hdr.FileInfo().IsDir() {
 			if err := os.MkdirAll(out, 0o755); err != nil {
 				return err
