@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -22,6 +24,7 @@ import (
 //   - fsnotify 监听 web/src 变更 → WebSocket(/__wf_hmr) 通知浏览器 import() 热替换
 type DevServer struct {
 	root       string
+	entry      string // 浏览器入口（URL 形式，如 /src/main.tsx）
 	watcher    *fsnotify.Watcher
 	upgrader   websocket.Upgrader
 	mu         sync.Mutex
@@ -38,13 +41,6 @@ func NewDevServer(root string) (*DevServer, error) {
 		return nil, err
 	}
 	abs, _ := filepath.Abs(root)
-	if err := w.Add(abs); err != nil {
-		return nil, err
-	}
-	if err := w.Add(filepath.Join(abs, "src")); err != nil { // 子目录（部分平台需显式监听）
-		fmt.Printf("[HMR] warn: cannot watch src: %v\n", err)
-	}
-	fmt.Printf("[HMR] watching %s and %s\n", abs, filepath.Join(abs, "src"))
 
 	rootDeps := map[string]string{}
 	modulesDir := "node_modules"
@@ -78,6 +74,7 @@ func NewDevServer(root string) (*DevServer, error) {
 
 	d := &DevServer{
 		root:       abs,
+		entry:      detectDevEntry(abs),
 		watcher:    w,
 		clients:    map[*websocket.Conn]bool{},
 		depsCache:  map[string][]byte{},
@@ -87,8 +84,52 @@ func NewDevServer(root string) (*DevServer, error) {
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+	// fsnotify 不递归：必须把 src 下每一层子目录都加进监听，
+	// 否则改 src/components/Foo.vue 这种文件时 HMR 完全收不到事件。
+	d.watchDirs(abs)
+	fmt.Printf("[HMR] watching %s (recursive)\n", abs)
 	go d.watch()
 	return d, nil
+}
+
+// detectDevEntry 找出浏览器入口（按常见约定排序）。
+func detectDevEntry(root string) string {
+	for _, p := range []string{
+		"src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js",
+		"src/entry-client.tsx", "src/entry-client.ts", "src/entry-client.jsx", "src/entry-client.js",
+	} {
+		if fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(p))); err == nil && !fi.IsDir() {
+			return "/" + p
+		}
+	}
+	return "/src/main.tsx"
+}
+
+// watchDirs 递归监听目录；跳过依赖/产物目录。
+func (d *DevServer) watchDirs(root string) {
+	_ = filepath.WalkDir(root, func(p string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		if p != root && ignoredDir(entry.Name()) {
+			return filepath.SkipDir
+		}
+		if err := d.watcher.Add(p); err != nil {
+			fmt.Printf("[HMR] warn: cannot watch %s: %v\n", p, err)
+		}
+		return nil
+	})
+}
+
+func ignoredDir(name string) bool {
+	switch name {
+	case "node_modules", "wf_modules", "dist", ".git", ".store":
+		return true
+	}
+	return false
 }
 
 // watch 监听源码变更并广播给所有 HMR 客户端。
@@ -98,6 +139,11 @@ func (d *DevServer) watch() {
 		// Remove(旧文件) 再 Create(新文件)：若在 Remove 时就广播，浏览器 import 会撞上
 		// 文件短暂不存在的 404。故跳过 Remove/Rename/Chmod，只在新内容就绪时热更。
 		if ev.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			continue
+		}
+		if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
+			// 新建目录（如 src/components）也要纳入监听，否则后续改动收不到。
+			d.watchDirs(ev.Name)
 			continue
 		}
 		ext := filepath.Ext(ev.Name)
@@ -154,8 +200,9 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 		importMapTag = "\n  <script type=\"importmap\">\n  " + string(importMapJSON) + "\n  </script>\n"
 	}
 
-	html := `<!doctype html><html><head><meta charset="utf-8"><title>webfront dev (HMR)</title>` +
-		importMapTag +
+	entry := strconv.Quote(d.entry)
+	html := fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8"><title>webfront dev (HMR)</title>`+
+		importMapTag+
 		`</head>
 <body>
 <div id="root"></div>
@@ -183,10 +230,12 @@ ws.onmessage = async (e) => {
     }
   }
 };
-import('/src/main.tsx?t=' + Date.now()).then(m => { render = m.render; render(); })
-  .catch(e => console.error('[HMR] initial import failed', e));
+import(%s + '?t=' + Date.now()).then(m => {
+  // main.* 约定导出 render() 以便热替换；entry-client.* 自己挂载，没有 render 也正常。
+  if (m && typeof m.render === 'function') { render = m.render; render(); }
+}).catch(e => console.error('[HMR] initial import failed', e));
 </script>
-</body></html>`
+</body></html>`, entry)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }
@@ -251,7 +300,13 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 //   - .vue：通过 compiler.CompileSFC 编译单文件组件（包含模板、脚本与样式注入）
 func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 	rel := strings.TrimPrefix(r.URL.Path, "/src/")
-	full := filepath.Join(d.root, "src", rel)
+	// path.Clean("/"+rel) 把 ../ 收敛到根内，避免 filepath.Join 被逃逸出 src/。
+	rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
+	full := filepath.Join(d.root, "src", filepath.FromSlash(rel))
+	if !strings.HasPrefix(full, filepath.Join(d.root, "src")+string(filepath.Separator)) {
+		http.Error(w, "bad path: "+rel, http.StatusBadRequest)
+		return
+	}
 	src, err := os.ReadFile(full)
 	if err != nil {
 		http.Error(w, "not found: "+rel, 404)
@@ -297,13 +352,25 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write([]byte(js))
 	case ".vue":
-		code, err := compiler.CompileSFC(d.root, d.modulesDir, string(src), full)
+		res, err := compiler.CompileSFCResult(d.root, d.modulesDir, string(src), full)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("vue compile error: %v", err), http.StatusInternalServerError)
 			return
 		}
+		// 与构建期一致：lang="ts" 的产物要再过一遍 TS 转译，否则浏览器会在
+		// `interface` / `ref<number>()` 处直接语法报错。
+		tr := api.Transform(res.Code, api.TransformOptions{
+			Loader:     compiler.SFCLoader(res.Lang),
+			Format:     api.FormatESModule,
+			Sourcefile: rel,
+			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
+		})
+		if len(tr.Errors) > 0 {
+			http.Error(w, fmt.Sprintf("vue ts transform error: %+v", tr.Errors), http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		w.Write([]byte(code))
+		w.Write(tr.Code)
 	default:
 		http.Error(w, "webfront dev: unsupported source type "+ext, http.StatusBadRequest)
 	}
