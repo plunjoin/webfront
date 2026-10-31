@@ -77,10 +77,10 @@ func BuildSSRWith(rootDir, entry, modulesDir string) ([]byte, error) {
 		// 让 async generator / 逻辑赋值等新语法由 esbuild 编译掉，
 		// 引擎（尤其 goja）就不用追新语法。客户端产物不降级。
 		Target:   api.ES2017,
-		LogLevel: api.LogLevelError,
+		LogLevel: api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
-		return nil, fmt.Errorf("esbuild SSR build: %+v", res.Errors)
+		return nil, fmt.Errorf("esbuild SSR build:\n%s", FormatMessages(res.Errors))
 	}
 	return res.OutputFiles[0].Contents, nil
 }
@@ -113,10 +113,10 @@ func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error)
 		MinifyWhitespace:  true,
 		MinifyIdentifiers: true,
 		MinifySyntax:      true,
-		LogLevel:          api.LogLevelError,
+		LogLevel:          api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
-		return nil, fmt.Errorf("esbuild client build: %+v", res.Errors)
+		return nil, fmt.Errorf("esbuild client build:\n%s", FormatMessages(res.Errors))
 	}
 	return res.OutputFiles[0].Contents, nil
 }
@@ -168,10 +168,10 @@ func BuildClientSplit(rootDir, entry, outDir, modulesDir string) ([]api.OutputFi
 		MinifyWhitespace:  true,
 		MinifyIdentifiers: true,
 		MinifySyntax:      true,
-		LogLevel:          api.LogLevelError,
+		LogLevel:          api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
-		return nil, fmt.Errorf("esbuild split build: %+v", res.Errors)
+		return nil, fmt.Errorf("esbuild split build:\n%s", FormatMessages(res.Errors))
 	}
 	// vendor.js 本身没人加载（它只是"锚点"），不落盘；入口产物统一改名：
 	// entry-client.js → client.js、entry-client.css → client.css，

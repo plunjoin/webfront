@@ -370,7 +370,7 @@ func createPreprocessor(absRoot, md, kind string) (*cssPreprocessor, error) {
 		Platform:      api.PlatformBrowser, // 浏览器构建：不碰 fs / path / node:*
 		AbsWorkingDir: absRoot,
 		NodePaths:     modulesNodePaths(absRoot, md),
-		LogLevel:      api.LogLevelError,
+		LogLevel:      api.LogLevelSilent,
 		Plugins:       storePlugins(absRoot, md),
 	}
 	init := ""
@@ -401,7 +401,7 @@ export { default as defaultOptions } from "less/lib/less/default-options.js";`,
 
 	res := api.Build(opts)
 	if len(res.Errors) > 0 {
-		return nil, fmt.Errorf("打包 %s（CSS 预处理器）失败: %s", pkgName, res.Errors[0].Text)
+		return nil, fmt.Errorf("打包 %s（CSS 预处理器）失败:\n%s", pkgName, FormatMessages(res.Errors))
 	}
 	prog, err := goja.Compile(pkgName+".js", string(res.OutputFiles[0].Contents), false)
 	if err != nil {

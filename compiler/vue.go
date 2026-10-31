@@ -144,7 +144,7 @@ func createCompilerInstance(rootDir, modulesDir string) (*compilerInstance, erro
 		EntryPoints:   []string{"@vue/compiler-sfc"},
 		AbsWorkingDir: abs,
 		NodePaths:     modulesNodePaths(rootDir, md),
-		LogLevel:      api.LogLevelError,
+		LogLevel:      api.LogLevelSilent,
 		Plugins: append(storePlugins(abs, md), api.Plugin{
 			Name: "ext-optional-sfc-deps",
 			Setup: func(b api.PluginBuild) {
@@ -178,7 +178,7 @@ func createCompilerInstance(rootDir, modulesDir string) (*compilerInstance, erro
 	}
 	res := api.Build(opts)
 	if len(res.Errors) > 0 {
-		return nil, fmt.Errorf("bundle @vue/compiler-sfc: %+v", res.Errors)
+		return nil, fmt.Errorf("bundle @vue/compiler-sfc:\n%s", FormatMessages(res.Errors))
 	}
 	compilerCode := string(res.OutputFiles[0].Contents)
 
