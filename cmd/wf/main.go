@@ -1,20 +1,39 @@
-// 极薄 CLI：wf build / wf install —— 纯 Go 调 esbuild + lockfile 安装器。
+// 极薄 CLI：wf build / wf install / wf dev —— 纯 Go 调 esbuild + lockfile 安装器。
 // 不参与运行期，不违反"单进程/不跑俩 service"。
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/plunjoin/webfront"
 	"github.com/plunjoin/webfront/compiler"
+	"github.com/plunjoin/webfront/dev"
 )
+
+func usage() {
+	fmt.Print(`wf — 纯 Go 的前端构建 / 开发工具
+
+usage:
+  wf build   [-modules dir] [-split] [-prerender routes.json] [-base path] [-out dir] [-mode ssr|spa] [rootDir]
+  wf install [-modules dir] [rootDir]
+  wf dev     [-tags dev] [-run "dev"] [-watch dir] [-ldflags "..."] [appDir]
+
+dev: 构建并运行 appDir 里的 main 包，Go 源码变更时自动重新编译、重启进程；
+     浏览器在进程重启后自动整页重载。前端（web/src）的热更由应用内挂载的
+     dev.DevServer 负责，改 tsx/vue/css 不会重启 Go 进程。
+`)
+}
 
 func main() {
 	if len(os.Args) < 2 || os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help" {
-		fmt.Println("usage: wf <build|install> [-modules <dir>] [-split] [-prerender routes.json] [-base <path>] [-out <dir>] [-mode <ssr|spa>] [rootDir]")
+		usage()
 		if len(os.Args) >= 2 && (os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help") {
 			os.Exit(0)
 		}
@@ -28,6 +47,10 @@ func main() {
 	base := fs.String("base", "/", "部署前缀（如 /site）；预渲染注入的资源路径会带上它，与 webfront.Config.BasePath 保持一致")
 	out := fs.String("out", "", "产物输出目录（默认 <webDir>/dist）")
 	mode := fs.String("mode", "ssr", "构建模式：ssr（默认）或 spa（纯客户端 SPA，跳过 SSR）")
+	tags := fs.String("tags", "dev", "wf dev：go build -tags（默认 dev；置空则不带 tag）")
+	run := fs.String("run", "dev", "wf dev：传给应用的参数（默认 dev，置空则不带参数）")
+	watch := fs.String("watch", "", "wf dev：监听根目录（默认取 go.mod 所在目录）")
+	ldflags := fs.String("ldflags", "", "wf dev：传给 go build 的 -ldflags")
 	_ = fs.Parse(os.Args[2:])
 
 	root := "."
@@ -171,6 +194,25 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("   ↳ 构建时自动挂载 StoreResolver：同一包的不同版本可共存")
+	case "dev":
+		// 进程级热重载：Go 换不掉进程里的机器码，只能重编译 + 换进程。
+		// 前端热更仍由应用内挂载的 dev.DevServer 负责，两条链路互不干扰。
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		opt := dev.SuperviseOptions{
+			Dir:      root,
+			Tags:     *tags,
+			RunArgs:  strings.Fields(*run),
+			WatchDir: *watch,
+		}
+		if *ldflags != "" {
+			opt.BuildArgs = []string{"-ldflags", *ldflags}
+		}
+		if err := dev.Supervise(ctx, opt); err != nil {
+			fmt.Println("✗ dev:", err)
+			os.Exit(1)
+		}
+		fmt.Println("👋 dev 已退出")
 	default:
 		fmt.Println("unknown command:", cmd)
 		os.Exit(1)

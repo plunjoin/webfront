@@ -12,6 +12,7 @@
 //	go build -tags dynamic -ldflags "-s -w" -o app.exe . → 动态 SSR / goja（15.6MB）
 //	go build -tags dev -ldflags "-s -w" -o app.exe .     → 开发服务器（esbuild + HMR，11.4MB）
 //	go run -tags dev . dev                               → 开发模式（带 HMR 热更）
+//	wf dev                                               → 同上，且改 .go 自动重启
 //
 // 默认构建 **不 import** jsruntime / compiler / dev：那会把 JS 引擎（9.5MB）和
 // esbuild 一起链进二进制。构建统一走 wf CLI。

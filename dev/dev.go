@@ -126,7 +126,7 @@ func (d *DevServer) watchDirs(root string) {
 
 func ignoredDir(name string) bool {
 	switch name {
-	case "node_modules", "wf_modules", "dist", ".git", ".store":
+	case "node_modules", "wf_modules", "dist", ".git", ".store", "vendor":
 		return true
 	}
 	return false
@@ -178,6 +178,12 @@ func (d *DevServer) Handler() http.Handler {
 	mux.HandleFunc("/src/", d.serveSrc)
 	mux.HandleFunc("/@deps/", d.serveDeps)
 	mux.HandleFunc("/__wf_hmr", d.serveWS)
+	// 探活：Go 进程重启期间浏览器靠它判断"服务回来了没有"。
+	// 必须足够轻——不要走 SSR，也不要有任何缓存。
+	mux.HandleFunc("/__wf_ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+	})
 	return mux
 }
 
@@ -207,11 +213,37 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 <body>
 <div id="root"></div>
 <script>
-const ws = new WebSocket('ws://' + location.host + '/__wf_hmr');
+const OVERLAY_ID = '__wf_dev_overlay';
+function showOverlay(text) {
+  let el = document.getElementById(OVERLAY_ID);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = OVERLAY_ID;
+    el.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(17,24,39,.94);color:#e5e7eb;font:13px/1.9 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;text-align:center';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+}
+function hideOverlay() {
+  const el = document.getElementById(OVERLAY_ID);
+  if (el) el.remove();
+}
+
 let render = null;
-ws.onmessage = async (e) => {
-  const m = JSON.parse(e.data);
-  if (m.type === 'update') {
+let connected = false;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  const ws = new WebSocket(proto + location.host + '/__wf_hmr');
+
+  ws.onopen = () => {
+    connected = true;
+    hideOverlay();
+  };
+
+  ws.onmessage = async (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type !== 'update') return;
     try {
       const isCSS = m.path.endsWith('.css');
       const mod = await import(m.path + '?t=' + Date.now());
@@ -228,8 +260,31 @@ ws.onmessage = async (e) => {
       console.error('[HMR] update failed, reloading page...', err);
       location.reload();
     }
-  }
-};
+  };
+
+  // 连接断开只有两种可能：页面正在跳转，或服务端没了（wf dev 正在重启
+  // Go 进程 / 进程崩了）。后者的正确姿势是等新进程起来再整页重载，
+  // 而不是立刻 reload —— 那会撞上一个"无法连接"的错误页。
+  ws.onclose = () => {
+    if (!connected) return;
+    connected = false;
+    // 600ms 才开始提示：实测 kill + 重启只有 300~500ms，太早弹层会闪一下。
+    setTimeout(() => showOverlay('⏳ 后端重启中…\nwf dev 正在重新编译 Go 代码，稍后自动刷新'), 600);
+    (async () => {
+      for (;;) {
+        try {
+          await fetch('/__wf_ping?t=' + Date.now(), { cache: 'no-store' });
+          break;
+        } catch (_) {
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+      location.reload();
+    })();
+  };
+}
+connect();
+
 import(%s + '?t=' + Date.now()).then(m => {
   // main.* 约定导出 render() 以便热替换；entry-client.* 自己挂载，没有 render 也正常。
   if (m && typeof m.render === 'function') { render = m.render; render(); }
