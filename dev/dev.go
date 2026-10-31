@@ -132,27 +132,6 @@ func ignoredDir(name string) bool {
 	return false
 }
 
-// formatMessages 把 esbuild 的 api.Message 摊平成人能读的文本。
-// 直接 %+v 会打出 `{ID: PluginName: Text:... Location:0xc000...}` 这种带指针
-// 的结构体字面量，浏览器覆盖层里根本没法看。
-func formatMessages(msgs []api.Message) string {
-	var b strings.Builder
-	for _, m := range msgs {
-		if m.Location != nil && m.Location.File != "" {
-			fmt.Fprintf(&b, "%s:%d:%d: %s\n", m.Location.File, m.Location.Line, m.Location.Column, m.Text)
-			if line := strings.TrimRight(m.Location.LineText, "\n"); line != "" {
-				fmt.Fprintf(&b, "  %s\n", line)
-			}
-		} else {
-			b.WriteString(m.Text + "\n")
-		}
-		for _, n := range m.Notes {
-			fmt.Fprintf(&b, "  note: %s\n", n.Text)
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
 // watch 监听源码变更并广播给所有 HMR 客户端。
 func (d *DevServer) watch() {
 	for ev := range d.watcher.Events {
@@ -378,7 +357,7 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 	}
 	res := api.Build(opts)
 	if len(res.Errors) > 0 {
-		http.Error(w, "bundle dep "+pkgSpec+" error:\n"+formatMessages(res.Errors), http.StatusInternalServerError)
+		http.Error(w, "bundle dep "+pkgSpec+" error:\n"+compiler.FormatMessages(res.Errors), http.StatusInternalServerError)
 		return
 	}
 
@@ -428,7 +407,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, formatMessages(res.Errors), 500)
+			http.Error(w, compiler.FormatMessages(res.Errors), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
@@ -440,7 +419,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Sourcefile: rel,
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, formatMessages(res.Errors), 500)
+			http.Error(w, compiler.FormatMessages(res.Errors), 500)
 			return
 		}
 		cssJSON, _ := json.Marshal(string(res.Code))
@@ -463,7 +442,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(tr.Errors) > 0 {
-			http.Error(w, "vue ts transform error:\n"+formatMessages(tr.Errors), http.StatusInternalServerError)
+			http.Error(w, "vue ts transform error:\n"+compiler.FormatMessages(tr.Errors), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
