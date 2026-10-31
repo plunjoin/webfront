@@ -341,10 +341,10 @@ web/wf_modules/
 
 示例工程实测：29 个包目录，`react/react-dom/vue/@vue/server-renderer/@vue/compiler-sfc` 5 个根依赖。
 
-> **为什么不做依赖解析**：实测纯 Go 从零解析会把 `scheduler ^0.23.2` 错解析成 `0.28.0-canary`。版本解析交给 npm/pnpm 一次性生成 lockfile，纯 Go 只做"精确拉取 + 校验 + 解压"，替代 `npm install` 的下载角色。
->
-> **现代 npm 包 `exports` 解析支持**：针对 Vue 3、Tailwind、React Router 等现代 ESM 包缺失根 `module` 或依赖条件导出的场景，解析器优先读取 `package.json` 中的 `exports` 规范（按 `"import" > "browser" > "module" > "default"` 优先级匹配条件），并支持精确子路径与通配符模式匹配（`./*`）。
->
+> **为什么不做依赖解析**：实测纯 Go 从零解析会把 `scheduler ^0.23.2` 错解析成 `0.28.0-canary`。版本解析交给 npm/pnpm 一次性生成 lockfile，纯 Go 只做"精确拉取 + 校验 + 解压"，替代 `npm install` 的下载角色。
+>
+> **现代 npm 包 `exports` 解析支持**：针对 Vue 3、Tailwind、React Router 等现代 ESM 包缺失根 `module` 或依赖条件导出的场景，解析器优先读取 `package.json` 中的 `exports` 规范（按 `"import" > "browser" > "module" > "default"` 优先级匹配条件），并支持精确子路径与通配符模式匹配（`./*`）。
+>
 > **16 协程并发下载加速**：`InstallStore` 采用带缓冲信号量的并发 Worker 池（限制 16 并发），大幅缩短海量依赖下载解压耗时。
 
 ### 4.7 SSG 预渲染（prerender.go）
@@ -441,12 +441,12 @@ defer func() {
 `New` / `NewWithTimeout` 在初始化阶段一次性将 `shim.js`、`ssr.js` 和收口脚本预编译为只读的 `*goja.Program`，每台 VM 启动无需重复解析 AST，大幅压低初始化延迟。
 
 **请求超时熔断与坏 VM 自动重建**：
-默认对单次渲染施加 5s 超时保护（支持 `SetTimeout`）。若前端业务代码发生死循环或阻塞，超时将触发 `vm.Interrupt` 强制中止。捕获到中断或异常 Panic 的 VM 会被直接废弃，并利用预编译的 Program 毫秒级重建全新健康的 VM 补充入池，防止资源泄露或 VM 池枯竭。
-
-**字节码预编译与启动加速**：
-`New` / `NewWithTimeout` 在初始化阶段一次性将 `shim.js`、`ssr.js` 和收口脚本预编译为只读的 `*goja.Program`，每台 VM 启动无需重复解析 AST，大幅压低初始化延迟。
-
-**请求超时熔断与坏 VM 自动重建**：
+默认对单次渲染施加 5s 超时保护（支持 `SetTimeout`）。若前端业务代码发生死循环或阻塞，超时将触发 `vm.Interrupt` 强制中止。捕获到中断或异常 Panic 的 VM 会被直接废弃，并利用预编译的 Program 毫秒级重建全新健康的 VM 补充入池，防止资源泄露或 VM 池枯竭。
+
+**字节码预编译与启动加速**：
+`New` / `NewWithTimeout` 在初始化阶段一次性将 `shim.js`、`ssr.js` 和收口脚本预编译为只读的 `*goja.Program`，每台 VM 启动无需重复解析 AST，大幅压低初始化延迟。
+
+**请求超时熔断与坏 VM 自动重建**：
 默认对单次渲染施加 5s 超时保护（支持 `SetTimeout`）。若前端业务代码发生死循环或阻塞，超时将触发 `vm.Interrupt` 强制中止。捕获到中断或异常 Panic 的 VM 会被直接废弃，并利用预编译的 Program 毫秒级重建全新健康的 VM 补充入池，防止资源泄露或 VM 池枯竭。
 
 ### 5.5 兼容边界（实测 34 项 ES 特性）
@@ -561,9 +561,9 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 { "type": "update", "path": "/src/App.tsx" }
 ```
 
-客户端收到后根据模块类型自适应处理：
-1. **主入口模块**（包含 `render` 导出）：直接调用最新 `mod.render()` 实现原地热替换；
-2. **`.css` 样式模块**：执行 `import(path + '?t=...')` 动态更新覆盖 DOM 中的 `<style>` 标签，无需整页刷新；
+客户端收到后根据模块类型自适应处理：
+1. **主入口模块**（包含 `render` 导出）：直接调用最新 `mod.render()` 实现原地热替换；
+2. **`.css` 样式模块**：执行 `import(path + '?t=...')` 动态更新覆盖 DOM 中的 `<style>` 标签，无需整页刷新；
 3. **普通子组件**（如 `App.tsx`、`App.vue`）：触发轻量整页刷新（依赖已被内存缓存，耗时 < 50ms），彻底穿透浏览器原生静态 ESM 缓存。
 
 **Windows 上的坑**：编辑器"改名式保存"（写 `.tmp` 再 rename）会先发 `Remove` 再发 `Create`。若在 `Remove` 时就广播，浏览器 `import()` 会撞上文件短暂不存在的 404。因此只监听 `Write|Create`，跳过 `Remove|Rename|Chmod`。
