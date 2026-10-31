@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.0.1 已实现并通过验证**（不再是设计草案）。最后更新：2026-10-28。
+> **状态：v0.1.0 已实现并通过验证**（不再是设计草案）。最后更新：2026-10-31。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.0.1 |
+| 维度 | 草案 v0 | 现状 v0.1.0 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **5 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cmd/wf`） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -74,7 +74,8 @@ webfront/
 │   ├── prerender.go       ReadRoutes · Prerender · PageFile
 │   ├── install.go         InstallStore（lockfile 驱动的纯 Go 安装器）
 │   ├── store.go           版本化 store 解析（manifest.json）
-│   └── vue.go             @vue/compiler-sfc 的 esbuild 插件
+│   ├── vue.go             @vue/compiler-sfc 的 esbuild 插件
+│   └── preprocess.go      <style lang="scss|sass|less"> 的纯 Go 预处理器
 ├── jsruntime/           运行期：JS 引擎池（goja）
 │   ├── goja.go            Pool + 宿主 shim + 微任务收口
 │   └── quote.go           JS 字符串字面量转义
@@ -322,6 +323,23 @@ HTTP 实际传输（Accept-Encoding: gzip）  817 + 45,279 = 46,096 B
 - **动态 SSR 样式首屏直出（防 FOUC）**：服务端渲染期间将组件样式推入全局 `__WF_STYLES__`，并在渲染完成后聚合成 `<style>` 拼入 HTML `<head>`，彻底消灭首屏无样式闪烁。
 - **多工程与并发测试隔离**：以 `absRootDir|modulesDir` 隔离编译器实例，构建失败不入缓存，避免跨工程或单测相互污染。
 
+### 4.5.1 CSS 预处理器（preprocess.go）
+
+`<style lang="scss|sass|less">` 走的是同一条"打包成 IIFE → goja 里跑"的路子，但换了一份本体：
+
+| | 预处理器本体 | 入口 | 单文件耗时 |
+| --- | --- | --- | --- |
+| `scss` / `sass` | 项目装的 `sass`（dart-sass） | 包名 `sass` → exports 的浏览器构建 `sass.default.js`（6.4MB） | ≈60ms |
+| `less` | 项目装的 `less` | `less/lib/less/index.js` + `default-options.js`（核心工厂，413KB） | ≈5ms |
+
+三个设计取舍：
+
+1. **不内置、只按需加载**。预处理器从项目自己的 `node_modules` / `.store` 解析，和 `@vue/compiler-sfc` 完全同源——版本跟着项目走，二进制里不多带 6MB。没装就在**用到的那一刻**报 `npm i -D sass`，不会静默降级。
+2. **less 不能用它的浏览器构建**。`less/dist/less.js` 是给 `<script>` 标签用的 IIFE，一加载就摸 `window.less` / `document`；这里改成只打包核心工厂，环境（`Environment` + `FileManager` + `PluginLoader`）由驱动脚本自己拼，`@import` 的解析规则全部复用 `AbstractFileManager`，只把"读文件"换成 Go 的 `__wfRead`。
+3. **dart-sass 要避开它的 Node 分支**。`sass.dart.js` 用 `process.versions.node` 判断"这是不是真 Node"，判定为真就去 `require('url')`——goja 里没有 `require`，直接 `Dynamic require of "url" is not supported`。所以垫片里 `process.versions` 是个**空对象**，让它老老实实走浏览器分支。
+
+预处理器跑在**独立 VM** 里（不污染 `@vue/compiler-sfc` 的全局），只负责"预处理器 → 纯 CSS"；`scoped` / `:deep()` / `v-bind()` 仍交给 `compileStyle`，两步之间靠 `__wfStyles` 传一个 `[{content, scoped}]` 数组。`@use` / `@import` 的相对解析、`_partial`、目录 `index`、以及 `node_modules` 回退都在驱动的 importer 里（sass 用 `canonicalize` / `load`，less 用 `loadFileSync` + `syncImport`，因此整条链路同步，不需要在 goja 里处理 Promise）。
+
 ### 4.6 版本化 store（store.go / install.go）
 
 `wf install` 读 `package-lock.json`，纯 Go 下载 `.tgz` + `sha512` integrity 校验 + 解压，物化成 pnpm 式 store：
@@ -551,7 +569,7 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 | --- | --- |
 | `.ts` / `.tsx` / `.js` / `.jsx` | `api.Transform` → ESM，`process.env.NODE_ENV="development"` |
 | `.css` | Transform 出 CSS 后包成"导入即注入 `<style>`"的 ESM 模块 |
-| `.vue` | `compiler.CompileSFC`（SFC 编译 + 作用域样式提取注入 + 预编译 VM 池） |
+| `.vue` | `compiler.CompileSFCResult`（SFC 编译 + 预处理器 + 作用域样式提取注入 + 预编译 VM 池） |
 
 ### 7.2 HMR 协议
 

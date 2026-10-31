@@ -3,9 +3,6 @@
 *.test
 *.out
 
-# 测试文件
-*_test.go
-
 # 前端产物（wf build 生成）
 **/dist/*
 !**/dist/.gitkeep
