@@ -41,6 +41,12 @@ func ReadRoutes(file string) ([]Route, error) {
 // Prerender 在 JS 引擎里渲染每条路由 → 写入 outDir/pages/*.html。
 // bundle 是已构建好的 SSR 产物（复用 wf build 的那一份，不重复构建）。
 func Prerender(bundle []byte, routes []Route, outDir, clientScript string) ([]string, error) {
+	return PrerenderWithBase(bundle, routes, outDir, clientScript, "")
+}
+
+// PrerenderWithBase 同 Prerender，但会把部署前缀交给引擎：
+// 这样自动注入的 <link rel="stylesheet" href="<base>/assets/client.css"> 才带得上前缀。
+func PrerenderWithBase(bundle []byte, routes []Route, outDir, clientScript, basePath string) ([]string, error) {
 	pool, err := jsruntime.New(bundle, 2)
 	if err != nil {
 		return nil, err
@@ -50,11 +56,19 @@ func Prerender(bundle []byte, routes []Route, outDir, clientScript string) ([]st
 	if clientScript == "" {
 		clientScript = "/assets/client.js"
 	}
-	eng, err := webfront.New(webfront.Config{
+	cfg := webfront.Config{
 		Mode:         webfront.ModeSSR,
 		Renderer:     pool,
 		ClientScript: clientScript,
-	})
+		BasePath:     basePath,
+	}
+	// 把产物目录当作 clientFS：assemble 只有看到 assets/client.css 才会补 <link>，
+	// 否则预渲染页面首屏会缺样式（动态 SSR 有 EmbedFS，预渲染这条路径没有）。
+	if _, statErr := os.Stat(filepath.Join(outDir, "assets", "client.css")); statErr == nil {
+		cfg.EmbedFS = os.DirFS(outDir)
+		cfg.DistDir = "."
+	}
+	eng, err := webfront.New(cfg)
 	if err != nil {
 		return nil, err
 	}

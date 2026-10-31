@@ -3,12 +3,39 @@ package compiler
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/evanw/esbuild/pkg/api"
 )
+
+// DetectServerEntry 在 webDir 下按约定探测 SSR 入口，返回相对路径（找不到返回 ""）。
+// 覆盖 entry-server.tsx/.ts/.jsx/.js 以及 Vue 常用的 entry-server.vue.tsx 写法。
+func DetectServerEntry(webDir string) string {
+	return detectEntry(webDir, []string{
+		"src/entry-server.tsx", "src/entry-server.ts", "src/entry-server.jsx", "src/entry-server.js",
+		"src/entry-server.vue.tsx", "src/entry-server.vue.ts", "src/entry-server.vue.jsx", "src/entry-server.vue.js",
+	})
+}
+
+// DetectClientEntry 探测客户端入口：优先 entry-client.*，回退 main.*。
+func DetectClientEntry(webDir string) string {
+	return detectEntry(webDir, []string{
+		"src/entry-client.tsx", "src/entry-client.ts", "src/entry-client.jsx", "src/entry-client.js",
+		"src/main.tsx", "src/main.ts", "src/main.jsx", "src/main.js",
+	})
+}
+
+func detectEntry(webDir string, candidates []string) string {
+	for _, p := range candidates {
+		if fi, err := os.Stat(filepath.Join(webDir, filepath.FromSlash(p))); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
 
 // modulesNodePaths：当依赖目录不叫 node_modules 时，把它作为 esbuild 的 NodePaths
 // （等价 NODE_PATH 语义），从而在"自定义依赖目录名"下也能解析包。
