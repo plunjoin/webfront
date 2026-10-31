@@ -130,8 +130,12 @@ const sassDriver = `(function () {
       });
       return JSON.stringify({ css: res && res.css ? String(res.css) : '' });
     } catch (e) {
-      var msg = (e && e.message) ? e.message : String(e);
-      if (e && e.span && e.span.url) { msg = fromHref(e.span.url) + ': ' + msg; }
+      // dart-sass 的 e.message 往往只有一句 "Undefined variable."，具体位置在
+      // e.span 里（0 基）。这里补上"行:列"，外层会再补文件名与 <style> 阶段。
+      var msg = (e && (e.sassMessage || e.message)) ? (e.sassMessage || e.message) : String(e);
+      if (e && e.span && e.span.start && e.span.start.line != null) {
+        msg = (e.span.start.line + 1) + ':' + (e.span.start.column + 1) + ': ' + msg;
+      }
       return JSON.stringify({ error: msg });
     }
   };
@@ -302,7 +306,17 @@ func preprocessKind(lang string) (kind string, ok bool) {
 
 // preprocessStyle 把一段 <style lang="..."> 源码编译成纯 CSS。
 // lang 为空或 css 时原样返回；不支持的预处理器返回带指引的错误。
-func preprocessStyle(rootDir, modulesDir, lang, source, filename string) (string, error) {
+//
+// 和 CompileSFCResult 一样，这里保证"错误只会以 error 返回"：
+// sass / less 的异常由 JS 侧 catch 成 {error} 再回传，外层再兜一层 recover。
+func preprocessStyle(rootDir, modulesDir, lang, source, filename string) (css string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			css = ""
+			err = fmt.Errorf("<style lang=%q> 预处理器内部错误（已恢复）: %v", lang, r)
+		}
+	}()
+
 	kind, ok := preprocessKind(lang)
 	if !ok {
 		return "", fmt.Errorf("<style lang=%q> 暂不支持（可用：css / scss / sass / less）", lang)

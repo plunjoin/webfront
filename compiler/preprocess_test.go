@@ -3,6 +3,7 @@ package compiler
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -169,6 +170,10 @@ func TestCompileSFCSCSSError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Undefined variable") {
 		t.Fatalf("错误信息应来自 sass，实际: %v", err)
+	}
+	// dart-sass 的 message 只有一句话，行列在 span 里；不带位置的话报错基本没用。
+	if !regexp.MustCompile(`\d+:\d+`).MatchString(err.Error()) {
+		t.Fatalf("错误信息应带上行:列，实际: %v", err)
 	}
 }
 

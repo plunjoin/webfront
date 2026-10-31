@@ -132,6 +132,27 @@ func ignoredDir(name string) bool {
 	return false
 }
 
+// formatMessages 把 esbuild 的 api.Message 摊平成人能读的文本。
+// 直接 %+v 会打出 `{ID: PluginName: Text:... Location:0xc000...}` 这种带指针
+// 的结构体字面量，浏览器覆盖层里根本没法看。
+func formatMessages(msgs []api.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		if m.Location != nil && m.Location.File != "" {
+			fmt.Fprintf(&b, "%s:%d:%d: %s\n", m.Location.File, m.Location.Line, m.Location.Column, m.Text)
+			if line := strings.TrimRight(m.Location.LineText, "\n"); line != "" {
+				fmt.Fprintf(&b, "  %s\n", line)
+			}
+		} else {
+			b.WriteString(m.Text + "\n")
+		}
+		for _, n := range m.Notes {
+			fmt.Fprintf(&b, "  note: %s\n", n.Text)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // watch 监听源码变更并广播给所有 HMR 客户端。
 func (d *DevServer) watch() {
 	for ev := range d.watcher.Events {
@@ -229,6 +250,20 @@ function hideOverlay() {
   if (el) el.remove();
 }
 
+// import() 失败时只给一句 "Failed to fetch dynamically imported module"，
+// 真正的编译错误在 500 的响应体里，所以再取一次。
+async function showError(path, err) {
+  let detail = (err && err.message) ? err.message : String(err);
+  try {
+    const r = await fetch(path + '?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) {
+      const text = await r.text();
+      if (text) detail = text;
+    }
+  } catch (_) {}
+  showOverlay('编译失败：' + path + '\n\n' + String(detail).trim() + '\n\n修好后会自动刷新');
+}
+
 let render = null;
 let connected = false;
 
@@ -247,6 +282,7 @@ function connect() {
     try {
       const isCSS = m.path.endsWith('.css');
       const mod = await import(m.path + '?t=' + Date.now());
+      hideOverlay();
       if (mod.render) {
         render = mod.render;
         render();
@@ -257,8 +293,10 @@ function connect() {
         location.reload();
       }
     } catch (err) {
-      console.error('[HMR] update failed, reloading page...', err);
-      location.reload();
+      // 编译失败时不要 reload：那会变成白屏 + 控制台报错。把错误摆在页面上，
+      // 等下一次成功的 update 自然刷新。
+      console.error('[HMR] update failed', err);
+      await showError(m.path, err);
     }
   };
 
@@ -286,11 +324,15 @@ function connect() {
 connect();
 
 import(%s + '?t=' + Date.now()).then(m => {
+  hideOverlay();
   // main.* 约定导出 render() 以便热替换；entry-client.* 自己挂载，没有 render 也正常。
   if (m && typeof m.render === 'function') { render = m.render; render(); }
-}).catch(e => console.error('[HMR] initial import failed', e));
+}).catch(e => {
+  console.error('[HMR] initial import failed', e);
+  showError(%s, e);
+});
 </script>
-</body></html>`, entry)
+</body></html>`, entry, entry)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }
@@ -336,7 +378,7 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 	}
 	res := api.Build(opts)
 	if len(res.Errors) > 0 {
-		http.Error(w, fmt.Sprintf("bundle dep %s error: %+v", pkgSpec, res.Errors), http.StatusInternalServerError)
+		http.Error(w, "bundle dep "+pkgSpec+" error:\n"+formatMessages(res.Errors), http.StatusInternalServerError)
 		return
 	}
 
@@ -386,7 +428,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, fmt.Sprintf("%+v", res.Errors), 500)
+			http.Error(w, formatMessages(res.Errors), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
@@ -398,7 +440,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Sourcefile: rel,
 		})
 		if len(res.Errors) > 0 {
-			http.Error(w, fmt.Sprintf("%+v", res.Errors), 500)
+			http.Error(w, formatMessages(res.Errors), 500)
 			return
 		}
 		cssJSON, _ := json.Marshal(string(res.Code))
@@ -421,7 +463,7 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(tr.Errors) > 0 {
-			http.Error(w, fmt.Sprintf("vue ts transform error: %+v", tr.Errors), http.StatusInternalServerError)
+			http.Error(w, "vue ts transform error:\n"+formatMessages(tr.Errors), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")

@@ -586,6 +586,9 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 1. **主入口模块**（包含 `render` 导出）：直接调用最新 `mod.render()` 实现原地热替换；
 2. **`.css` 样式模块**：执行 `import(path + '?t=...')` 动态更新覆盖 DOM 中的 `<style>` 标签，无需整页刷新；
 3. **普通子组件**（如 `App.tsx`、`App.vue`）：触发轻量整页刷新（依赖已被内存缓存，耗时 < 50ms），彻底穿透浏览器原生静态 ESM 缓存。
+4. **编译失败**：`import()` reject，此时**不能刷新**（刷新只会白屏）。客户端回读那个 500 的响应体，把真正的错误（`文件:行:列` + 代码片段）盖在页面上，等下一次成功的 update 再自动刷新。
+
+> 错误一律是 `error` 返回值而不是 panic：goja 的 JS 异常本来就以 `*goja.Exception` 返回，各阶段再包上文件名与阶段名（`parse` / `compileScript` / `compileTemplate` / `compileStyle` / 预处理器）；`CompileSFCResult` 与 `preprocessStyle` 外面还各有一层 `recover`，保证即使 VM 或宿主回调出了意外，也不会把 dev server / 构建进程带走。
 
 **Windows 上的坑**：编辑器"改名式保存"（写 `.tmp` 再 rename）会先发 `Remove` 再发 `Create`。若在 `Remove` 时就广播，浏览器 `import()` 会撞上文件短暂不存在的 404。因此只监听 `Write|Create`，跳过 `Remove|Rename|Chmod`。
 

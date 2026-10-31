@@ -312,7 +312,18 @@ func CompileSFC(rootDir, modulesDir, source, filename string) (string, error) {
 //
 // 支持的 <style lang>：css / scss / sass / less。预处理器按需从项目依赖目录加载
 // （见 preprocess.go），没装对应包时会在用到的那一刻报出明确指引。
-func CompileSFCResult(rootDir, modulesDir, source, filename string) (SFCResult, error) {
+//
+// 错误契约：**任何编译错误都以 error 返回，不 panic**。goja 把 JS 异常作为
+// *goja.Exception 返回，各阶段再包上文件名与阶段名；这里额外兜一层 recover，
+// 保证即使 VM 或宿主回调里出了意外，也不会把 dev server / 构建进程带走。
+func CompileSFCResult(rootDir, modulesDir, source, filename string) (res SFCResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = SFCResult{}
+			err = fmt.Errorf("%s: SFC 编译内部错误（已恢复，未中断进程）: %v", filename, r)
+		}
+	}()
+
 	vm, cleanup, err := getCompilerVM(rootDir, modulesDir)
 	if err != nil {
 		return SFCResult{}, err

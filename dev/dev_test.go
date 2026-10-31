@@ -112,7 +112,7 @@ func TestDevIndexClientScript(t *testing.T) {
 	if res := api.Transform(script, api.TransformOptions{Loader: api.LoaderJS}); len(res.Errors) > 0 {
 		t.Fatalf("HMR 客户端脚本有语法错误: %+v\n%s", res.Errors, script)
 	}
-	for _, want := range []string{"/__wf_ping", "location.reload()", "showOverlay", "wss://"} {
+	for _, want := range []string{"/__wf_ping", "location.reload()", "showOverlay", "showError", "wss://"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("HMR 脚本缺少 %q", want)
 		}
@@ -126,5 +126,31 @@ func TestDevIndexClientScript(t *testing.T) {
 	}
 	if got := pr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("/__wf_ping Cache-Control = %q，期望 no-store", got)
+	}
+}
+
+// TestDevServeSrcErrorIs500 固化另一条契约：编译错误必须变成 500 + 可读文本，
+// 而不是 panic（dev server 与编译器同进程，panic 会直接带走整个进程）。
+func TestDevServeSrcErrorIs500(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "src", "Bad.vue"), []byte(`<template><div/></template>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := NewDevServer(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	ds.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/src/Bad.vue", nil))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("期望 500，实际 %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "vue compile error") {
+		t.Fatalf("响应体应带上编译错误，实际: %s", w.Body.String())
 	}
 }
