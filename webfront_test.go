@@ -9,6 +9,7 @@ package webfront
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -380,5 +381,87 @@ func TestHeadOnAsset(t *testing.T) {
 	}
 	if hdr.Get("Content-Length") == "" {
 		t.Error("HEAD 缺 Content-Length")
+	}
+}
+
+// failRenderer 模拟 goja 抛错：SSR 期间 render() 里 throw。
+type failRenderer struct{ err error }
+
+func (f *failRenderer) RenderHTML(url string, propsJSON []byte) (string, string, error) {
+	return "", "", f.err
+}
+func (f *failRenderer) Close() error { return nil }
+
+// SSR 渲染失败时绝不能静默：调用方普遍写 `_ = eng.Render(...)`，
+// 若引擎只 return err，浏览器会收到空白的 200。
+// 开发态要给一张带 goja 栈的错误页（Vite 的 error overlay 同款体验）。
+func TestRenderErrorPageInDev(t *testing.T) {
+	t.Setenv("WF_DEV", "")
+	e, err := New(Config{
+		Mode:     ModeSSR,
+		Dev:      true,
+		Renderer: &failRenderer{err: errors.New("render: Error: boom\n    at App (ssr.js:12:34)")},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	w := newPreset404Writer()
+	req := httptest.NewRequest(http.MethodGet, "/about", nil)
+	if err := e.Render(w, req, Page{URL: "/about"}); err == nil {
+		t.Fatal("渲染失败应同时返回 error 给调用方")
+	}
+	code, body, hdr := w.result()
+	if code != http.StatusInternalServerError {
+		t.Fatalf("状态码 = %d，期望 500", code)
+	}
+	if ct := hdr.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q，期望 text/html（要能在浏览器里直接看）", ct)
+	}
+	for _, want := range []string{"SSR 渲染失败", "/about", "Error: boom", "at App (ssr.js:12:34)"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("错误页缺少 %q:/n%s", want, body)
+		}
+	}
+	if hdr.Get("Cache-Control") != "no-store" {
+		t.Errorf("错误页不该被缓存，Cache-Control = %q", hdr.Get("Cache-Control"))
+	}
+}
+
+// 生产态不能把内部栈泄露给终端用户，但状态码必须是 500 而不是 200。
+func TestRenderErrorHiddenInProd(t *testing.T) {
+	t.Setenv("WF_DEV", "")
+	e, err := New(Config{
+		Mode:     ModeSSR,
+		Renderer: &failRenderer{err: errors.New("render: secret internal detail")},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	w := newPreset404Writer()
+	_ = e.Render(w, httptest.NewRequest(http.MethodGet, "/", nil), Page{URL: "/"})
+	code, body, _ := w.result()
+	if code != http.StatusInternalServerError {
+		t.Fatalf("状态码 = %d，期望 500", code)
+	}
+	if strings.Contains(body, "secret internal detail") {
+		t.Fatalf("生产态泄露了内部错误: %s", body)
+	}
+}
+
+// WF_DEV 由 wf dev 注入：不改代码也能让错误可见。
+func TestRenderErrorVisibleViaEnv(t *testing.T) {
+	t.Setenv("WF_DEV", "1")
+	e, err := New(Config{
+		Mode:     ModeSSR,
+		Renderer: &failRenderer{err: errors.New("render: env-visible")},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	w := newPreset404Writer()
+	_ = e.Render(w, httptest.NewRequest(http.MethodGet, "/", nil), Page{URL: "/"})
+	_, body, _ := w.result()
+	if !strings.Contains(body, "env-visible") {
+		t.Fatalf("WF_DEV=1 时应输出错误页，实际:\n%s", body)
 	}
 }

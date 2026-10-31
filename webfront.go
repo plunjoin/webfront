@@ -10,10 +10,15 @@ import (
 	"encoding/json"
 	"fmt"
 	htmlpkg "html"
+	"io"
 	"io/fs"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+
+	"github.com/plunjoin/webfront/devui"
 )
 
 type Mode string
@@ -73,11 +78,15 @@ type Engine struct {
 	renderer Renderer
 	clientFS fs.FS    // 生产态嵌入的客户端产物（//go:embed），nil 表示未配置
 	assets   sync.Map // 静态资源缓存：name -> *staticAsset（含 gzip 预压缩体）
+	dev      bool     // 开发态：渲染失败时把 goja 栈摆到浏览器上（否则只给 500）
 }
 
 // New 组装引擎。renderer 为空时进入静态模式（只服务预渲染页面）。
 func New(cfg Config) (*Engine, error) {
-	e := &Engine{cfg: cfg, base: NormalizeBase(cfg.BasePath), renderer: cfg.Renderer}
+	// WF_DEV 由 wf dev 注入给子进程：这样不用改代码，wf dev 起来的应用
+	// 自动进入"错误可见"模式（与 Vite 的 dev/prod 差异同构）。
+	dev := cfg.Dev || os.Getenv("WF_DEV") != ""
+	e := &Engine{cfg: cfg, base: NormalizeBase(cfg.BasePath), renderer: cfg.Renderer, dev: dev}
 	if cfg.EmbedFS != nil {
 		dist := cfg.DistDir
 		if dist == "" {
@@ -227,6 +236,10 @@ func (e *Engine) Render(w http.ResponseWriter, r *http.Request, page Page) error
 	if e.renderer != nil {
 		doc, err := e.RenderHTML(url, page)
 		if err != nil {
+			// 关键：这里必须自己写响应。调用方普遍写成 `_ = eng.Render(...)`，
+			// 若只 return err，浏览器会收到一个空白的 200 —— 也就是"goja 报错了
+			// 但页面上什么都看不到"。开发态直接给一张 Vite 风格的错误页。
+			e.writeRenderError(w, url, err)
 			return err
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -239,6 +252,28 @@ func (e *Engine) Render(w http.ResponseWriter, r *http.Request, page Page) error
 		return nil
 	}
 	return e.servePrerendered(w, r, url)
+}
+
+// writeRenderError 把 SSR / goja 的失败变成"看得见"的东西。
+//   - 开发态（Config.Dev 或 WF_DEV）：整页换成错误页，带上 goja 的栈；
+//   - 生产态：只给 500 和一句人话，绝不把内部栈泄露给终端用户。
+func (e *Engine) writeRenderError(w http.ResponseWriter, url string, err error) {
+	h := w.Header()
+	h.Del("Content-Length")
+	h.Set("Cache-Control", "no-store")
+	if !e.dev {
+		http.Error(w, "webfront: 页面渲染失败（详情见服务端日志）", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[webfront] SSR %s 渲染失败:\n%v", url, err)
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = io.WriteString(w, devui.ErrorPage(devui.PageOptions{
+		Title:  "SSR 渲染失败",
+		File:   url,
+		Detail: err.Error(),
+		Hint:   "goja 执行 src/entry-server.* 时抛错 · 开发态错误页，生产构建不会出现",
+	}))
 }
 
 // servePrerendered 静态模式：/ → pages/index.html，/about → pages/about.html。
