@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.2（工作区，尚未发版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 都是 v0.1.2 新增，v0.1.1 没有。这些改动发布到 main 之前，安装命令仍会拿到 v0.1.1。
+> **文档对应 v0.1.2（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 都是 v0.1.2 新增。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -51,8 +51,7 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-# v0.1.2 尚未发版：先用 main；发版后换成 @v0.1.2
-go get github.com/plunjoin/webfront@main
+go get github.com/plunjoin/webfront@v0.1.2
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
@@ -357,7 +356,7 @@ r.Handle("/*", eng)
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
 | `go install github.com/plunjoin/webfront/cmd/wf@main` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@main` | 直接跑 | 一次性使用，不登记任何东西（v0.1.2 发版后把 `@main` 换成 `@v0.1.2`） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.2` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -594,14 +593,14 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.1 已发布；当前工作区还包含下一版的未发布改动（见下方 changelog）。以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.2 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
 
-### 未发布（下一版）
+### v0.1.2 相对 v0.1.1
 
 - **React/Vue 当模板引擎**：`wf build -mode template` 只产 `ssr.js`；运行期 `RenderTemplate` / `RenderTemplateTo` 直接接收 struct / map
 - **零配置形态识别**：`Config.Mode` 可省略，按 `Renderer` → `pages/*.html` → `index.html` 自动判动态 SSR / 静态 / SPA
