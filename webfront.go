@@ -1,9 +1,10 @@
 // Package webfront: a 100% pure-Go front-end runtime.
 // No Node.js, no CGO. Embeds as an http.Handler / Gin middleware.
 //
-// 两种运行形态，链接成本差一个数量级：
+// 三种运行形态，链接成本差一个数量级：
 //   - 动态 SSR：Config.Renderer = jsruntime.New(ssrBundle, n) → 带 JS 引擎（≈15.6MB）
-//   - 预渲染 ：不设 Renderer，直接服务 wf build -prerender 产出的 HTML（≈6.9MB，无引擎）
+//   - 预渲染/静态：不设 Renderer，dist 里有 pages/*.html → 直接发 HTML（≈6.9MB，无引擎）
+//   - 纯客户端 SPA：不设 Renderer，dist 里只有 index.html → 文件 + History fallback（≈6.9MB）
 package webfront
 
 import (
@@ -24,9 +25,12 @@ import (
 type Mode string
 
 const (
-	ModeSPA     Mode = "spa"     // 纯客户端渲染（零 JS 引擎开销）
-	ModeSSR     Mode = "ssr"     // 全页面服务端渲染 + 客户端 Hydration
-	ModeIslands Mode = "islands" // Astro 孤岛模式（默认零 JS，按需水合）
+	// ModeSPA：ServeHTTP 只做文件服务 + index.html History fallback，不跑 JS。
+	ModeSPA Mode = "spa"
+	// ModeSSR：Renderer 非 nil 时动态 SSR；nil 时服务预渲染页（静态 / SSG）。
+	ModeSSR Mode = "ssr"
+	// ModeIslands 仍是占位值：ServeHTTP 退化为 SSR 分支。
+	ModeIslands Mode = "islands"
 )
 
 // Config：遵循"零配置可用，按需覆盖"
@@ -36,18 +40,25 @@ type Config struct {
 	// 设为 "/site" 时：注入的客户端脚本路径自动带前缀；预渲染页面查找、
 	// StaticHandler 取文件都会先剥掉这个前缀。前端代码里仍按 "/about" 写路由，
 	// 不需要知道自己被挂在哪儿。
-	BasePath    string
-	Mode        Mode   // 运行模式，默认 ModeSPA
-	Dev         bool   // true: esbuild 实时转译 + fsnotify + HMR
+	BasePath string
+	// Mode 可选。零值表示自动识别：
+	//   Renderer != nil           → ModeSSR（动态 SSR）
+	//   dist 里有 pages/**.html   → ModeSSR（预渲染 / 静态）
+	//   dist 里有 index.html      → ModeSPA（纯客户端 SPA）
+	// 显式设置则钉死行为，不再探测（ModeSPA 强制 SPA；ModeSSR 强制 SSR/静态）。
+	Mode        Mode
+	Dev         bool   // true: SSR 错误页显示 goja 栈（esbuild/HMR 由 wf dev 或 dev.DevServer 提供）
 	EmbedFS     fs.FS  // 生产环境嵌入的文件系统（//go:embed）
 	DistDir     string // 生产产物在 EmbedFS 中的子路径，默认 "dist"
 	ServerEntry string // SSR 入口，默认自动探测 src/entry-server.(tsx|ts)
 	ModulesDir  string // 依赖目录名，默认 "node_modules"（可改为 "wf_modules" 等）
-	// Renderer 动态渲染器。为 nil 时引擎走"预渲染静态模式"：
-	// 直接按 URL 取 <dist>/pages/<path>.html，不再执行任何 JS。
+	// Renderer 动态渲染器。为 nil 时不执行任何 JS：
+	// dist 里有 pages/*.html 就按 URL 取预渲染页；只有 index.html 时
+	// ServeHTTP 自动走 SPA 外壳。有效形态见 Engine.Mode()。
 	Renderer Renderer
-	// ClientScript 注入页面的客户端脚本路径，默认 "<BasePath>/assets/client.js"。
-	// 设为 "-" 可关闭注入（例如纯静态、无需 hydration 的页面）。
+	// ClientScript 注入页面的客户端脚本路径，默认 "<BasePath>/assets/client.js"
+	// （仅当 EmbedFS 里确实存在该文件时）。设为 "-" 可关闭注入
+	// （例如纯静态、无需 hydration 的页面）。
 	ClientScript string
 }
 
@@ -74,6 +85,7 @@ type Head struct {
 // Engine 是 webfront 的核心。
 type Engine struct {
 	cfg      Config
+	mode     Mode   // New 解析后的有效模式（Mode() 可见）
 	base     string // 归一化后的 BasePath："" 或 "/site"（无尾斜杠）
 	renderer Renderer
 	clientFS fs.FS    // 生产态嵌入的客户端产物（//go:embed），nil 表示未配置
@@ -81,7 +93,9 @@ type Engine struct {
 	dev      bool     // 开发态：渲染失败时把 goja 栈摆到浏览器上（否则只给 500）
 }
 
-// New 组装引擎。renderer 为空时进入静态模式（只服务预渲染页面）。
+// New 组装引擎并解析有效运行模式。
+// renderer 为空时不跑 JS：有 pages/ 服务预渲染页，只有 index.html 则 ServeHTTP 走 SPA；
+// 显式 Mode 可覆盖自动识别。Effective mode 用 Engine.Mode() 读取。
 func New(cfg Config) (*Engine, error) {
 	// WF_DEV 由 wf dev 注入给子进程：这样不用改代码，wf dev 起来的应用
 	// 自动进入"错误可见"模式（与 Vite 的 dev/prod 差异同构）。
@@ -101,8 +115,61 @@ func New(cfg Config) (*Engine, error) {
 	if e.renderer == nil && e.clientFS == nil {
 		return nil, fmt.Errorf("webfront: 既没有 Renderer 也没有 EmbedFS，无从取页面")
 	}
+	e.mode = resolveMode(cfg.Mode, e.renderer, e.clientFS)
 	return e, nil
 }
+
+// resolveMode 把"零值 = 自动"解析成有效模式。顺序即优先级：
+// 显式配置 → 动态 SSR → 预渲染页 → SPA 外壳 → 无产物的静态兜底。
+// 探测只读 EmbedFS，不改变 New 的错误契约：产物缺失不会让 New 失败。
+func resolveMode(explicit Mode, renderer Renderer, clientFS fs.FS) Mode {
+	if explicit != "" {
+		return explicit
+	}
+	if renderer != nil {
+		return ModeSSR
+	}
+	if hasPrerenderedPages(clientFS) {
+		return ModeSSR // Renderer == nil + ModeSSR 就是"只服务预渲染页"
+	}
+	if fileExists(clientFS, "index.html") {
+		return ModeSPA
+	}
+	return ModeSSR // 空 dist / 还没构建：保持旧的请求期 404，不提前报错
+}
+
+// hasPrerenderedPages 判断 dist/pages 下是否存在任意 .html。
+// 不能只看 pages/index.html：routes.json 未必包含 "/"。
+func hasPrerenderedPages(clientFS fs.FS) bool {
+	if clientFS == nil {
+		return false
+	}
+	found := false
+	_ = fs.WalkDir(clientFS, "pages", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // pages 不存在就是没有预渲染页
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".html") {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// fileExists 判断嵌入文件系统里的普通文件是否存在；目录不算。
+func fileExists(fsys fs.FS, name string) bool {
+	if fsys == nil {
+		return false
+	}
+	fi, err := fs.Stat(fsys, name)
+	return err == nil && !fi.IsDir()
+}
+
+// Mode 返回 New 解析后的有效运行模式（零值 Mode 也会被解析成具体值）。
+// ModeSSR + Static()==true 表示预渲染/静态；ModeSSR + Static()==false 表示动态 SSR。
+func (e *Engine) Mode() Mode { return e.mode }
 
 // NormalizeBase 把用户写的 BasePath 归一化成 "" 或 "/prefix"（无尾斜杠）。
 // 导出是为了让 CLI（wf build -base）与引擎用同一套规则，避免两处不一致。
@@ -135,7 +202,8 @@ func (e *Engine) stripBase(p string) string {
 	return p
 }
 
-// Static 表示当前引擎不做运行期渲染。
+// Static 表示当前引擎没有 JS 渲染器（预渲染 / 纯静态产物）。
+// 自动模式下 Renderer == nil 也可能解析成 ModeSPA：判断有效形态请用 Mode()。
 func (e *Engine) Static() bool { return e.renderer == nil }
 
 // Close 释放渲染器（若有）。
@@ -220,7 +288,9 @@ func (e *Engine) clientScript() string {
 		}
 		return e.cfg.ClientScript
 	}
-	if e.clientFS != nil {
+	// 默认路径只在产物里确实有 client.js 时注入：template 模式 / 只嵌 ssr.js
+	// 的工程不该拿到一个 404 的 <script>。
+	if e.clientFS != nil && fileExists(e.clientFS, "assets/client.js") {
 		return e.base + "/assets/client.js"
 	}
 	return ""
@@ -252,6 +322,50 @@ func (e *Engine) Render(w http.ResponseWriter, r *http.Request, page Page) error
 		return nil
 	}
 	return e.servePrerendered(w, r, url)
+}
+
+// RenderTemplate 把 name 当作"模板名"（SSR 入口里的组件键），data 可以是任意
+// 可 JSON 序列化的值（struct / map / nil），返回完整 HTML；不写响应。
+// 这是把 React/Vue 当 Go 模板引擎用的快捷入口：
+//
+//	html, err := eng.RenderTemplate("Home", HomeData{Title: "首页"})
+func (e *Engine) RenderTemplate(name string, data any) (string, error) {
+	props, err := templateProps(data)
+	if err != nil {
+		return "", err
+	}
+	return e.RenderHTML(name, Page{URL: name, Props: props})
+}
+
+// RenderTemplateTo 是 RenderTemplate 的 http.Handler 版本：渲染并写响应。
+// 序列化/渲染失败时和 Render 一样自己写 500（开发态是错误页），调用方只记日志。
+func (e *Engine) RenderTemplateTo(w http.ResponseWriter, r *http.Request, name string, data any) error {
+	props, err := templateProps(data)
+	if err != nil {
+		e.writeRenderError(w, name, err)
+		return err
+	}
+	return e.Render(w, r, Page{URL: name, Props: props})
+}
+
+// templateProps 把任意可 JSON 序列化的 data 变成 Page.Props。
+// nil → 空对象（模板里可以直接解构，不会拿到 null）。
+func templateProps(data any) (map[string]any, error) {
+	if data == nil {
+		return map[string]any{}, nil
+	}
+	if m, ok := data.(map[string]any); ok {
+		return m, nil
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("webfront: template data: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("webfront: template data 必须是 JSON 对象: %w", err)
+	}
+	return m, nil
 }
 
 // writeRenderError 把 SSR / goja 的失败变成"看得见"的东西。
@@ -317,31 +431,47 @@ func (e *Engine) serveSPA(w http.ResponseWriter, r *http.Request) {
 	e.serveAsset(w, r, a, "no-cache")
 }
 
-// StaticHandler 见 static.go（带 gzip 预压缩 + ETag 缓存）。
-
-// ServeHTTP 实现标准库 http.Handler，框架无关。
-func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 前缀不匹配的请求不该由本引擎接管（例如挂在 /site，却收到 /other）。
-	if e.base != "" {
-		p := r.URL.Path
-		if p != e.base && !strings.HasPrefix(p, e.base+"/") {
+// SPAHandler 返回"文件直出 + index.html History fallback"的 handler。
+// 它与 Mode / Renderer 无关，因此同一个 Engine 可以默认走 SSR，
+// 再把某个子路径交给它：
+//
+//	mux.Handle("/assets/", eng.StaticHandler())
+//	mux.Handle("/app/", eng.SPAHandler()) // 纯客户端路由
+//	mux.Handle("/", eng)                  // SSR
+//
+// 需要 EmbedFS 的 dist 里有 index.html；路径按 Config.BasePath 剥离，
+// 缓存策略与 ModeSPA 完全相同（真实文件 1h，外壳 no-cache）。
+func (e *Engine) SPAHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !e.inBase(r.URL.Path) {
 			http.NotFound(w, r)
 			return
 		}
+		e.serveSPA(w, r)
+	})
+}
+
+// StaticHandler 见 static.go（带 gzip 预压缩 + ETag 缓存）。
+
+// inBase 判断请求路径是否落在 Config.BasePath 下。
+func (e *Engine) inBase(p string) bool {
+	return e.base == "" || p == e.base || strings.HasPrefix(p, e.base+"/")
+}
+
+// ServeHTTP 实现标准库 http.Handler，框架无关。
+// 有效模式由 New 解析：ModeSPA 走 SPA 分支，其余（SSR / 静态 / Islands）都走 Render。
+func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 前缀不匹配的请求不该由本引擎接管（例如挂在 /site，却收到 /other）。
+	if !e.inBase(r.URL.Path) {
+		http.NotFound(w, r)
+		return
 	}
 
-	if e.cfg.Mode == ModeSPA {
+	if e.mode == ModeSPA {
 		e.serveSPA(w, r)
 		return
 	}
-	if e.cfg.Mode == ModeSSR || e.Static() {
-		_ = e.Render(w, r, Page{
-			URL:   r.URL.Path,
-			Props: map[string]any{"title": "webfront SSR", "path": e.stripBase(r.URL.Path)},
-		})
-		return
-	}
-	// ModeIslands 尚未实现，退化为 SSR。
+	// ModeSSR / 静态 / ModeIslands 占位（退化为 SSR）都走同一条渲染路径。
 	_ = e.Render(w, r, Page{
 		URL:   r.URL.Path,
 		Props: map[string]any{"title": "webfront SSR", "path": e.stripBase(r.URL.Path)},

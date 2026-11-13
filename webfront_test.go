@@ -215,6 +215,79 @@ func TestSPAModeServesShellAndAssets(t *testing.T) {
 // BasePath：前缀剥离、资源前缀注入、越界拒绝
 // ---------------------------------------------------------------------------
 
+// captureRenderer 记录引擎传给 SSR 入口的模板名和 Props。
+type captureRenderer struct {
+	url   string
+	props string
+	html  string
+	head  string
+}
+
+func (c *captureRenderer) RenderHTML(url string, propsJSON []byte) (string, string, error) {
+	c.url = url
+	c.props = string(propsJSON)
+	return c.html, c.head, nil
+}
+func (c *captureRenderer) Close() error { return nil }
+
+func TestRenderTemplate(t *testing.T) {
+	r := &captureRenderer{html: `<div id="root">hi</div>`, head: "<title>T</title>"}
+	e, err := New(Config{Mode: ModeSSR, Renderer: r, ClientScript: "-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	doc, err := e.RenderTemplate("Home", struct {
+		Title string `json:"title"`
+	}{Title: "首页"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.url != "Home" {
+		t.Fatalf("模板名 = %q, want Home", r.url)
+	}
+	if !strings.Contains(r.props, `"title":"首页"`) {
+		t.Fatalf("Props 没带上 struct 字段: %s", r.props)
+	}
+	if !strings.Contains(doc, "<title>T</title>") || !strings.Contains(doc, `<div id="root">hi</div>`) {
+		t.Fatalf("HTML 拼装不对: %s", doc)
+	}
+}
+
+func TestRenderTemplateTo(t *testing.T) {
+	r := &captureRenderer{html: `<div id="root">hi</div>`}
+	e, err := New(Config{Mode: ModeSSR, Renderer: r, ClientScript: "-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	if err := e.RenderTemplateTo(w, req, "Home", map[string]any{"title": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "hi") {
+		t.Fatalf("body = %q", w.Body.String())
+	}
+}
+
+func TestRenderTemplateRejectsNonObject(t *testing.T) {
+	e, err := New(Config{Mode: ModeSSR, Renderer: &captureRenderer{html: "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	if _, err := e.RenderTemplate("Home", []int{1, 2}); err == nil {
+		t.Fatal("非对象 data 应该返回 error")
+	}
+}
+
 func TestNormalizeBase(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"", ""}, {"/", ""}, {"site", "/site"}, {"/site/", "/site"}, {"//a//", "//a"},
@@ -269,6 +342,17 @@ func TestClientScriptBasePrefix(t *testing.T) {
 	e3 := staticEngine(t, func(c *Config) { c.ClientScript = "-" })
 	if got := e3.clientScript(); got != "" {
 		t.Errorf("ClientScript=%q 没有关闭注入", got)
+	}
+
+	// 产物里没有 assets/client.js（如只嵌 ssr.js 的 template 工程）→ 不注入
+	ssrOnly := fstest.MapFS{"dist/ssr.js": {Data: []byte("x")}}
+	e4, err := New(Config{EmbedFS: ssrOnly, DistDir: "dist", Renderer: &fakeRenderer{html: "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e4.Close()
+	if got := e4.clientScript(); got != "" {
+		t.Errorf("缺少 client.js 时不应注入，got %q", got)
 	}
 }
 
@@ -445,6 +529,216 @@ func TestRenderErrorHiddenInProd(t *testing.T) {
 	}
 	if strings.Contains(body, "secret internal detail") {
 		t.Fatalf("生产态泄露了内部错误: %s", body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 零配置模式解析：Renderer / pages/ / index.html 自动识别 SSR 与 SPA
+// ---------------------------------------------------------------------------
+
+func newTestEngine(t *testing.T, cfg Config) *Engine {
+	t.Helper()
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	return e
+}
+
+func indexOnlyFS() fstest.MapFS {
+	return fstest.MapFS{
+		"dist/index.html":       {Data: []byte("<!doctype html><html><body><div id=\"root\"></div><script type=\"module\" src=\"/assets/client.js\"></script></body></html>")},
+		"dist/assets/client.js": {Data: []byte("console.log('client')")},
+	}
+}
+
+// 有 Renderer 就是动态 SSR —— 哪怕 dist 里同时存在预渲染页。
+func TestAutoModeWithRendererIsSSR(t *testing.T) {
+	e := newTestEngine(t, Config{
+		EmbedFS:  distMapFS(),
+		DistDir:  "dist",
+		Renderer: &fakeRenderer{html: `<div id="root">live-ssr</div>`},
+	})
+	if e.Mode() != ModeSSR {
+		t.Fatalf("Mode() = %q, want ssr", e.Mode())
+	}
+	if e.Static() {
+		t.Fatal("有 Renderer 时 Static() 应为 false")
+	}
+	code, body, _ := serveReq(e, http.MethodGet, "/about", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, "live-ssr") {
+		t.Fatalf("自动 SSR 应动态渲染，got %d %q", code, body)
+	}
+	if strings.Contains(body, "prerendered-about") {
+		t.Fatal("有 Renderer 时不应回落到预渲染页")
+	}
+}
+
+// 没有 Renderer、但有 pages/**.html → 静态 / SSG。
+func TestAutoModePrefersPrerenderedPages(t *testing.T) {
+	e := newTestEngine(t, Config{EmbedFS: distMapFS(), DistDir: "dist"})
+	if e.Mode() != ModeSSR || !e.Static() {
+		t.Fatalf("Mode()=%q Static()=%v, want ssr/true", e.Mode(), e.Static())
+	}
+	code, body, _ := serveReq(e, http.MethodGet, "/about", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, "prerendered-about") {
+		t.Fatalf("GET /about = %d %q", code, body)
+	}
+}
+
+// pages 下没有 index.html 也算预渲染（routes.json 未必包含 "/"）。
+func TestAutoModePagesWithoutIndex(t *testing.T) {
+	fsys := fstest.MapFS{
+		"dist/pages/about.html": {Data: []byte("<!doctype html><html><body>only-about</body></html>")},
+		"dist/index.html":       {Data: []byte("<!doctype html><html><body>spa-shell</body></html>")},
+	}
+	e := newTestEngine(t, Config{EmbedFS: fsys, DistDir: "dist"})
+	if e.Mode() != ModeSSR || !e.Static() {
+		t.Fatalf("有 pages/about.html 时应判为静态，got Mode()=%q", e.Mode())
+	}
+}
+
+// 只有 index.html、没有 pages/ → SPA。
+func TestAutoModeIndexOnlyIsSPA(t *testing.T) {
+	e := newTestEngine(t, Config{EmbedFS: indexOnlyFS(), DistDir: "dist"})
+	if e.Mode() != ModeSPA {
+		t.Fatalf("Mode() = %q, want spa", e.Mode())
+	}
+	code, body, _ := serveReq(e, http.MethodGet, "/users/42", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("SPA fallback = %d %q", code, body)
+	}
+	code, _, _ = serveReq(e, http.MethodGet, "/assets/client.js", nil).result()
+	if code != http.StatusOK {
+		t.Fatalf("SPA 静态资源 = %d, want 200", code)
+	}
+}
+
+// 空 dist（还没构建）不提前报错，保持旧的请求期 404。
+func TestAutoModeEmptyDistFallsBackToStatic(t *testing.T) {
+	fsys := fstest.MapFS{"dist/assets/client.js": {Data: []byte("x")}}
+	e := newTestEngine(t, Config{EmbedFS: fsys, DistDir: "dist"})
+	if e.Mode() != ModeSSR || !e.Static() {
+		t.Fatalf("空 dist 应兜底为静态，got Mode()=%q Static()=%v", e.Mode(), e.Static())
+	}
+	code, _, _ := serveReq(e, http.MethodGet, "/", nil).result()
+	if code != http.StatusNotFound {
+		t.Fatalf("空 dist 请求 = %d, want 404", code)
+	}
+}
+
+// 显式 Mode 永远覆盖自动探测。
+func TestExplicitModeOverridesDetection(t *testing.T) {
+	// 有 pages/ 也强制 SPA
+	e := newTestEngine(t, Config{EmbedFS: distMapFS(), DistDir: "dist", Mode: ModeSPA})
+	if e.Mode() != ModeSPA {
+		t.Fatalf("Mode() = %q, want spa", e.Mode())
+	}
+	code, body, _ := serveReq(e, http.MethodGet, "/about", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("显式 SPA 应回外壳，got %d %q", code, body)
+	}
+
+	// 只有 index.html 也强制静态
+	e2 := newTestEngine(t, Config{EmbedFS: indexOnlyFS(), DistDir: "dist", Mode: ModeSSR})
+	if e2.Mode() != ModeSSR || !e2.Static() {
+		t.Fatalf("Mode()=%q Static()=%v, want ssr/true", e2.Mode(), e2.Static())
+	}
+	code, _, _ = serveReq(e2, http.MethodGet, "/users/42", nil).result()
+	if code != http.StatusNotFound {
+		t.Fatalf("显式静态不应有 SPA 回退，got %d", code)
+	}
+}
+
+// SPAHandler 与 Mode 无关：同一个 Engine 可以 SSR 为主，子路径交给 SPA。
+func TestSPAHandler(t *testing.T) {
+	e := newTestEngine(t, Config{EmbedFS: indexOnlyFS(), DistDir: "dist"})
+	h := e.SPAHandler()
+
+	code, body, _ := serveReq(h, http.MethodGet, "/app/users", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("SPAHandler fallback = %d %q", code, body)
+	}
+	code, _, _ = serveReq(h, http.MethodGet, "/assets/client.js", nil).result()
+	if code != http.StatusOK {
+		t.Fatalf("SPAHandler 静态资源 = %d, want 200", code)
+	}
+
+	// 没有 EmbedFS / index.html 时明确 404
+	e2 := newTestEngine(t, Config{Renderer: &fakeRenderer{html: "x"}})
+	code, body, _ = serveReq(e2.SPAHandler(), http.MethodGet, "/x", nil).result()
+	if code != http.StatusNotFound || !strings.Contains(body, "SPA") {
+		t.Fatalf("无 EmbedFS 的 SPAHandler = %d %q", code, body)
+	}
+}
+
+func TestSPAHandlerRespectsBasePath(t *testing.T) {
+	e := newTestEngine(t, Config{EmbedFS: indexOnlyFS(), DistDir: "dist", BasePath: "/site"})
+	code, body, _ := serveReq(e.SPAHandler(), http.MethodGet, "/site/app/users", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("带前缀的 SPAHandler = %d %q", code, body)
+	}
+	code, _, _ = serveReq(e.SPAHandler(), http.MethodGet, "/app/users", nil).result()
+	if code != http.StatusNotFound {
+		t.Fatalf("前缀之外的请求 = %d, want 404", code)
+	}
+}
+
+// 同一 engine + 同一份 EmbedFS：默认 SSR，/app/ 子路径走 SPA。
+func TestOneEngineSSRAndSPA(t *testing.T) {
+	e := newTestEngine(t, Config{
+		EmbedFS:  distMapFS(),
+		DistDir:  "dist",
+		Renderer: &fakeRenderer{html: `<div id="root">live-ssr</div>`},
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/app/", e.SPAHandler())
+	mux.Handle("/", e)
+
+	code, body, _ := serveReq(mux, http.MethodGet, "/app/users", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("GET /app/users = %d %q", code, body)
+	}
+	if strings.Contains(body, "live-ssr") {
+		t.Fatal("/app/ 不应走 SSR")
+	}
+
+	code, body, _ = serveReq(mux, http.MethodGet, "/about", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, "live-ssr") {
+		t.Fatalf("GET /about = %d %q", code, body)
+	}
+}
+
+// ModeSPA 只影响 ServeHTTP 的文档分派；显式调用 Render/RenderTemplate 仍可用 Renderer。
+func TestModeSPAWithRendererKeepsRenderAPI(t *testing.T) {
+	e := newTestEngine(t, Config{
+		EmbedFS:  indexOnlyFS(),
+		DistDir:  "dist",
+		Mode:     ModeSPA,
+		Renderer: &fakeRenderer{html: `<p>template</p>`},
+	})
+	code, body, _ := serveReq(e, http.MethodGet, "/x", nil).result()
+	if code != http.StatusOK || !strings.Contains(body, `<div id="root"></div>`) {
+		t.Fatalf("ServeHTTP = %d %q", code, body)
+	}
+	w := httptest.NewRecorder()
+	if err := e.RenderTemplateTo(w, httptest.NewRequest(http.MethodGet, "/", nil), "T", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(w.Body.String(), "<p>template</p>") {
+		t.Fatalf("RenderTemplateTo 没用 Renderer: %q", w.Body.String())
+	}
+}
+
+// 模板用法只需 Renderer：没有 EmbedFS 时自动 SSR，也不会注入客户端脚本。
+func TestTemplateEngineMinimalConfig(t *testing.T) {
+	e := newTestEngine(t, Config{Renderer: &captureRenderer{html: `<p>t</p>`}})
+	if e.Mode() != ModeSSR || e.Static() {
+		t.Fatalf("Mode()=%q Static()=%v, want ssr/false", e.Mode(), e.Static())
+	}
+	if src := e.clientScript(); src != "" {
+		t.Fatalf("无 EmbedFS 时不应注入客户端脚本，got %q", src)
 	}
 }
 
