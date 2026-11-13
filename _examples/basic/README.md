@@ -1,12 +1,15 @@
-# basic —— 三形态最小示例
+# basic —— 四形态最小示例
 
-同一份前端工程（`web/`），用 build tag 切出三种运行形态：
+同一份前端工程（`web/`），用 build tag + 构建产物切出四种运行形态：
 
 | 形态 | 命令 | 体积 | 说明 |
 | --- | --- | --- | --- |
-| 预渲染静态（SSG） | `go build .` | 6.89 MB | 不链接 JS 引擎，只发预生成的 HTML |
-| 动态 SSR | `go build -tags dynamic .` | 15.62 MB | 带 goja，每请求实时渲染 |
-| 开发服务器 | `wf dev`（或 `go run -tags dev . dev`） | 11.36 MB | esbuild 单文件转译 + WebSocket HMR；改 `.go` 自动重启 |
+| 预渲染静态（SSG） | `wf build` + `go build .` | 6.89 MB | 不链接 JS 引擎，只发预生成的 HTML |
+| 纯客户端 SPA | `wf build -mode spa` + `go build .` | 6.89 MB | 不链接 JS 引擎，`index.html` + History fallback |
+| 动态 SSR | `wf build` + `go build -tags dynamic .` | 15.62 MB | 带 goja，每请求实时渲染 |
+| 开发服务器 | `wf dev`（`go run -tags dev . dev` 只有前端 HMR） | 11.36 MB | esbuild 单文件转译 + WebSocket HMR；`wf dev` 额外负责改 `.go` 自动重编译重启 |
+
+`main.go` 不再手写 `Mode`：有 Renderer 就是动态 SSR；`dist/pages/` 存在就是静态；只有 `index.html` 就是 SPA。
 
 ## 先构建前端产物
 
@@ -14,20 +17,25 @@
 在**仓库根目录**执行：
 
 ```bash
-go run ./cmd/wf install -modules wf_modules ./_examples/basic
-go run ./cmd/wf build   -modules wf_modules \
-    -prerender _examples/basic/web/routes.json ./_examples/basic
+go run ./cmd/wf install ./_examples/basic
+go run ./cmd/wf build   ./_examples/basic           # SSG / 动态 SSR 产物
+# 或者只建纯客户端 SPA：
+go run ./cmd/wf build -mode spa ./_examples/basic   # 只有 index.html + assets/
 ```
 
 两条命令都是纯 Go：`install` 读 `web/package-lock.json` 拉依赖到 `web/wf_modules/.store/`，
 `build` 调 esbuild 出 `web/dist/{ssr.js, assets/*, pages/*.html}`。
+
+> 在你自己的项目里不需要克隆这个仓库：`go get -tool github.com/plunjoin/webfront/cmd/wf`
+> 之后在项目根目录直接 `go tool wf install` / `go tool wf build`（依赖目录与 routes.json
+> 自动探测），版本随你的 `go.mod` 走。仓库内的 `go run ./cmd/wf` 只是开发库自身时的等价写法。
 
 ## 再按形态构建
 
 ```bash
 cd _examples/basic
 
-go build -ldflags "-s -w" -o app.exe .                 # 预渲染静态
+go build -ldflags "-s -w" -o app.exe .                 # 预渲染静态 / 纯 SPA（看 dist 形态）
 go build -tags dynamic -ldflags "-s -w" -o app.exe .   # 动态 SSR
 go run -tags dev . dev                                 # 开发模式（改 web/src 即热更）
 
@@ -38,7 +46,8 @@ go run -tags dev . dev                                 # 开发模式（改 web/
 它比 `go run -tags dev . dev` 多了一层——**改 `.go` 会自动重新编译并重启进程**，
 浏览器在重启完成后自己刷新，不用手动 Ctrl-C 再起一次。
 
-> 忘了先构建产物也不会崩：程序启动时会提示缺哪一步，`/` 返回 404。
+> 默认静态 / SPA 构建忘了先构建产物也不会崩：启动时会提示缺哪一步，`/` 返回 404。
+> `-tags dynamic` 缺 `web/dist/ssr.js` 时会在启动阶段直接报错退出（没有脚本可执行）。
 
 ## 目录
 

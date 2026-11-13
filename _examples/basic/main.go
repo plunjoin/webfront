@@ -43,8 +43,18 @@ func runSSR() {
 	if err != nil {
 		panic(err)
 	}
-	if eng.Static() {
-		if _, err := distFS.ReadFile("web/dist/pages/index.html"); err != nil {
+	// 自动识别后的形态决定启动检查与页面分派。
+	desc := modeDesc
+	switch {
+	case eng.Mode() == webfront.ModeSPA:
+		desc = "纯客户端 SPA · 无 JS 引擎"
+		if _, err := distFS.ReadFile("web/dist/index.html"); err != nil {
+			fmt.Println("⚠ 二进制里没有 SPA 外壳 web/dist/index.html，先构建前端产物（在仓库根执行）：")
+			fmt.Println("   go run ./cmd/wf build -mode spa ./_examples/basic")
+			fmt.Println("   然后回到本目录重新 go build。")
+		}
+	case eng.Static():
+		if _, err := distFS.ReadDir("web/dist/pages"); err != nil {
 			fmt.Println("⚠ 二进制里没有预渲染页面，先构建前端产物（在仓库根执行）：")
 			fmt.Println("   go run ./cmd/wf install -modules wf_modules ./_examples/basic")
 			fmt.Println("   go run ./cmd/wf build -modules wf_modules -prerender _examples/basic/web/routes.json ./_examples/basic")
@@ -54,17 +64,23 @@ func runSSR() {
 	mux := http.NewServeMux()
 	// 客户端产物从二进制内直接服务（gzip + ETag），磁盘上无需 web/dist
 	mux.Handle("/assets/", eng.StaticHandler())
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_ = eng.Render(w, r, webfront.Page{
-			URL: r.URL.Path,
-			Props: map[string]any{
-				"title": "webfront SSR Demo",
-				"name":  "零 Node 世界",
-				"path":  r.URL.Path,
-			},
+	if eng.Mode() == webfront.ModeSPA {
+		// SPA：命中文件直出，未命中回 index.html（History fallback）。
+		mux.Handle("/", eng)
+	} else {
+		// SSR / 静态：由业务侧决定每页的 Props。
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			_ = eng.Render(w, r, webfront.Page{
+				URL: r.URL.Path,
+				Props: map[string]any{
+					"title": "webfront SSR Demo",
+					"name":  "零 Node 世界",
+					"path":  r.URL.Path,
+				},
+			})
 		})
-	})
-	fmt.Println("✅ webfront demo on http://localhost:8080  （" + modeDesc + "）")
+	}
+	fmt.Println("✅ webfront demo on http://localhost:8080  （" + desc + "）")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		panic(err)
 	}

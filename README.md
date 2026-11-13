@@ -4,6 +4,8 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
+> **文档对应 v0.1.2（工作区，尚未发版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 都是 v0.1.2 新增，v0.1.1 没有。这些改动发布到 main 之前，安装命令仍会拿到 v0.1.1。
+
 ```go
 // 一行接入：Engine 就是 http.Handler
 mux.Handle("/", engine)
@@ -17,28 +19,46 @@ mux.Handle("/", engine)
 | 可选引擎 | 不渲染动态页面就不链接 JS 引擎，二进制 7.0MB；要动态 SSR 才 +9.5MB |
 | 框架无关 | 库本身不依赖任何 Web 框架（`go.mod` 只有 4 个直接依赖） |
 
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [接入指南](docs/GUIDE.md) | 从零接进已有 Go 项目：SPA / 预渲染 / 动态 SSR / 模板引擎 / 混合部署 / Docker / 排错 |
+| [API 契约](docs/API.md) | `ServeHTTP` / `Render` / `RenderHTML` 谁写响应、状态码、错误与缓存行为 |
+| [架构设计](ARCHITECTURE.md) | 设计取舍与验证方法 |
+
+> **只想把 React/Vue 当 Go 的模板引擎？** 不需要客户端入口 / hydration / `routes.json`：
+> `go tool wf build -mode template` 只产 `ssr.js`，运行期 `eng.RenderTemplateTo(w, r, "Home", data)`
+> 直接输出 HTML。见 [接入指南](docs/GUIDE.md) 开头。
+
 ---
 
-## 三种形态，同一份代码
+## 四种形态，同一份代码
 
 | 形态 | 构建 | 体积 | 适用 |
 | --- | --- | --- | --- |
-| **预渲染静态（SSG）** | `go build .` | **6.89 MB** | 内容站、文档、营销页——构建期出 HTML，运行期只发文件 |
-| **动态 SSR** | `go build -tags dynamic .` | **15.62 MB** | 需要按请求查库、按用户渲染的页面 |
-| **开发服务器** | `wf dev`（或 `go run -tags dev . dev`） | 11.36 MB | 本地开发：esbuild 单文件转译 + WebSocket HMR，改 `.go` 自动重启 |
+| **纯客户端 SPA** | `wf build -mode spa` + `go build .` | **6.89 MB** | 后台、工具型页面——路由和渲染都在浏览器 |
+| **预渲染静态（SSG）** | `wf build` + `go build .` | **6.89 MB** | 内容站、文档、营销页——构建期出 HTML，运行期只发文件 |
+| **动态 SSR** | `wf build` + `go build -tags dynamic .` | **15.62 MB** | 需要按请求查库、按用户渲染的页面 |
+| **开发服务器** | `wf dev`（`go run -tags dev . dev` 只有前端 HMR） | 11.36 MB | 本地开发：esbuild 单文件转译 + WebSocket HMR；`wf dev` 额外负责改 `.go` 自动重编译重启 |
 
-> 三者共用同一个 `main.go`，靠 build tag 切换 `newEngine()` 的实现。引擎有没有被链进二进制，由你 `import` 哪个包决定。
+> 四种形态共用同一个 `main.go`：静态 / SPA 走默认构建，动态 SSR 用 `-tags dynamic`，开发服务器用 `-tags dev`。静态与 SPA 的差别只在 `wf build` 的产物，`main.go` 按 `eng.Mode()` 自动分派。引擎有没有被链进二进制，由你 `import` 哪个包决定。
+>
+> **`Config.Mode` 可以省略**：有 `Renderer` 自动判为动态 SSR；`dist/pages/*.html` 存在自动判为预渲染；只有 `index.html` 自动判为 SPA。同一个 engine 想同时提供 SSR 和某个 SPA 子路径，把子路径挂到 `eng.SPAHandler()` 即可。
 
 ---
 
 ## 安装
 
 ```bash
-# 获取 webfront 核心运行时与编译包
-go get github.com/plunjoin/webfront@v0.1.0
+# v0.1.2 尚未发版：先用 main；发版后换成 @v0.1.2
+go get github.com/plunjoin/webfront@main
 
-# 可选：安装命令行工具 wf（支持 wf install / wf build 等）
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.0
+# 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
+go get -tool github.com/plunjoin/webfront/cmd/wf
+
+# 或者装成全局命令
+go install github.com/plunjoin/webfront/cmd/wf@main
 ```
 
 在 Go 代码中引用：
@@ -111,12 +131,18 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 ### 2. 构建前端产物（纯 Go，零 Node）
 
 ```bash
-# 拉依赖：读 package-lock.json，下载 .tgz + 校验 sha512，物化成版本化 store
-go run ./cmd/wf install -modules wf_modules ./web
+# 在含 web/ 的目录执行；依赖目录自动探测（wf_modules → node_modules）
+go run ./cmd/wf install
 
-# 打包：SSR bundle + 客户端 ESM(含 vendor chunk) + 预渲染页面
-go run ./cmd/wf build -modules wf_modules -prerender web/routes.json ./web
+# 打包 SSR + 客户端；web/routes.json 存在时自动预渲染
+go run ./cmd/wf build
 ```
+
+> 不是项目根目录时把路径当参数传：`go run ./cmd/wf build ./_examples/basic`。
+> 所有参数都有默认值，`-modules` / `-prerender` 只在需要覆盖自动探测时才写。
+
+> 上面是**在本仓库里**的写法。第三方项目把 `go run ./cmd/wf` 换成 `go tool wf`
+> （先用 `go get -tool github.com/plunjoin/webfront/cmd/wf` 登记一次），见 [CLI](#cli) 一节。
 
 产物：
 
@@ -125,7 +151,7 @@ web/dist/
 ├── ssr.js                        # IIFE，挂 globalThis.__WF_APP__ = { render }
 ├── assets/client.js              # 入口（几百字节）
 ├── assets/chunks/chunk-*.js      # React/Vue 等 vendor，content hash
-├── pages/index.html              # 预渲染页面（-prerender 才有）
+├── pages/index.html              # 预渲染页面（存在 web/routes.json 时自动生成）
 └── index.html                    # SPA 回退
 ```
 
@@ -139,8 +165,7 @@ var distFS embed.FS
 
 func main() {
     eng, err := webfront.New(webfront.Config{
-        Mode:    webfront.ModeSSR,
-        EmbedFS: distFS,
+        EmbedFS: distFS, // dist 里有 pages/ → 自动判为预渲染
         DistDir: "web/dist",
     })
     if err != nil { panic(err) }
@@ -164,8 +189,7 @@ func main() {
     if err != nil { panic(err) }
 
     eng, err := webfront.New(webfront.Config{
-        Mode:     webfront.ModeSSR, // 必须显式设，否则 ServeHTTP 走 SPA 分支
-        Renderer: pool,             // ← 唯一区别：把渲染器交给引擎
+        Renderer: pool, // ← 唯一区别：有 Renderer 就自动是动态 SSR
         EmbedFS:  distFS,
         DistDir:  "web/dist",
     })
@@ -185,7 +209,17 @@ func main() {
 }
 ```
 
-> **`Renderer` 为 nil = 静态模式**，引擎包不会进入编译单元，二进制里就没有 JS 引擎。这是 6.89MB ↔ 15.62MB 的唯一开关。
+> **`Renderer` 为 nil = 不链接 JS 引擎**，二进制里没有 goja。这是 6.89MB ↔ 15.62MB 的唯一开关；至于这份无引擎产物是预渲染还是纯 SPA，由 `dist` 里有没有 `pages/*.html` 自动决定。
+>
+> **最常用的三种配置**：
+>
+> | 想要 | 只需要写 |
+> | --- | --- |
+> | 动态 SSR | `Config{EmbedFS: distFS, DistDir: "web/dist", Renderer: pool}` |
+> | 预渲染 / 纯 SPA | `Config{EmbedFS: distFS, DistDir: "web/dist"}`（有 `pages/` 是静态，只有 `index.html` 是 SPA） |
+> | React/Vue 当模板引擎 | `Config{Renderer: pool}`（不需要 `EmbedFS`） |
+>
+> 需要钉死行为时再写 `Mode: webfront.ModeSSR` / `ModeSPA`；显式值永远优先于自动识别。
 
 ---
 
@@ -197,27 +231,47 @@ func main() {
 | --- | --- | --- |
 | `RootDir` | `"./web"` | 前端工程目录（仅 `compiler.New` 用它构建 SSR，运行期不需要） |
 | `BasePath` | `"/"` | 挂载前缀；设 `/site` 后页面查找、静态资源、脚本注入都会先剥/补前缀 |
-| `Mode` | — | `ModeSSR`（动态或预渲染 SSR）/ `ModeSPA`（纯客户端 SPA，支持 History 路由 fallback）/ `ModeIslands` |
+| `Mode` | 自动 | 可省略。零值按产物识别：有 `Renderer` → `ModeSSR`；有 `pages/*.html` → `ModeSSR`（静态）；只有 `index.html` → `ModeSPA`。显式 `ModeSSR` / `ModeSPA` 可钉死行为（`ModeIslands` 仍退化为 SSR） |
 | `Dev` | `false` | 开发态标记 |
 | `EmbedFS` | `nil` | `//go:embed` 进来的产物 |
 | `DistDir` | `"dist"` | 产物在 `EmbedFS` 里的子路径，**相对 EmbedFS 根**（如 `"web/dist"`） |
 | `ServerEntry` | 自动探测 | `src/entry-server.{tsx,ts,jsx,js}`，以及 Vue 约定的 `entry-server.vue.*`（仅 `compiler.New` 构建 SSR 用） |
 | `ModulesDir` | `"node_modules"` | 依赖目录名，可用 `"wf_modules"` |
-| `Renderer` | `nil` | 见下；`nil` 即静态模式 |
-| `ClientScript` | `"/assets/client.js"` | 注入页面的脚本路径（有 `EmbedFS` 时才默认注入）；设为 `"-"` 关闭 |
+| `Renderer` | `nil` | 有它 = 动态 SSR；为 `nil` = 不链接 JS 引擎，再按 `pages/` / `index.html` 自动区分静态与 SPA |
+| `ClientScript` | `"<BasePath>/assets/client.js"` | 注入页面的脚本路径（有 `EmbedFS` 且存在 `assets/client.js` 时才默认注入）；以 `/` 开头时自动补 `BasePath`；设为 `"-"` 关闭 |
 
 > 引擎池大小不在 `Config` 里：只有真正创建 VM 池的那一层才需要它 —— `compiler.New(cfg, vmPoolSize)`（自编译入口）或 `jsruntime.New(bundle, poolSize)`（生产入口，见上例）。
 
 ### `webfront.Engine`
 
-| 方法 | 用途 |
-| --- | --- |
-| `ServeHTTP(w, r)` | 实现 `http.Handler`，直接挂路由（SPA 模式下提供 History 路由 fallback） |
-| `Render(w, r, Page) error` | 显式渲染并写响应（动态跑引擎，静态取预渲染页） |
-| `RenderHTML(url, Page) (string, error)` | 只返回完整 HTML 字符串，不写响应 |
-| `StaticHandler() http.Handler` | 服务 `EmbedFS` 里的客户端产物（gzip 预压缩 + sha1 ETag + 304） |
-| `Static() bool` | 当前是否静态模式（无引擎） |
-| `Close() error` | 释放渲染器 |
+| 方法 | 写响应？ | 行为 |
+| --- | --- | --- |
+| `ServeHTTP(w, r)` | 是 | 实现 `http.Handler`。有效模式为 SPA：命中嵌入文件直出，未命中回 `index.html`；SSR/静态：用默认 Props 调 `Render` |
+| `SPAHandler() http.Handler` | 是 | 只做 SPA 文件服务 + `index.html` fallback，与 `Mode`/`Renderer` 无关。用于同一 engine 的 SPA 子路径 |
+| `Mode() Mode` | 否 | `New` 解析后的有效模式（自动识别结果可见） |
+| `Render(w, r, Page) error` | 是 | 动态：成功 200，失败自己写 500 并返回 err；静态：取 `pages/*.html`，未命中写 404 且**返回 nil** |
+| `RenderHTML(url, Page) (string, error)` | 否 | 只返回完整 HTML；要求有 Renderer；**不剥 BasePath** |
+| `RenderTemplate(name, data) (string, error)` | 否 | 把 `name` 当模板名；`data` 可为 struct / map / nil，自动 JSON 序列化 |
+| `RenderTemplateTo(w, r, name, data) error` | 是 | 模板引擎版 `Render`：失败自己写 500，成功写 200 + HTML |
+| `StaticHandler() http.Handler` | 是 | 服务 `EmbedFS` 产物（gzip 预压缩 + sha1 ETag + 304） |
+| `Static() bool` | 否 | 是否没有 JS 渲染器（`Renderer == nil`）；自动 SPA 也可能为 true，判形态请用 `Mode()` |
+| `Close() error` | 否 | 释放渲染器 |
+
+> 精确语义（状态码、缓存头、错误响应、BasePath 规则）见 [API 契约](docs/API.md)。
+
+### 接入时最容易踩的坑
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| SPA 首页正常，刷新 `/users` 404 | 用 `Render` 做 fallback | SPA 用 `ServeHTTP`（`mux.Handle("/", eng)`）或子路径用 `SPAHandler()` |
+| SSR 正常，`/app/*` 却 404 | SPA 子路径没挂 handler | `mux.Handle("/app/", eng.SPAHandler())` |
+| `Render` 返回 err 后自己写的 fallback 没生效 | `Render` 已经写了 500 | 自定义错误页改用 `RenderHTML` |
+| `routes.json` 有内容，`dist/pages/` 却为空 | 字段写成了 `"url"` | 改成 `"path"` |
+| `go build` 报 `pattern all:web/dist: no matching files found` | `dist` 为空 | 提交 `web/dist/.gitkeep`，用 `//go:embed all:...` |
+| 子路径部署后 JS/CSS 404 | `-base` 与 `BasePath` 不一致 | 两边用同一个前缀 |
+| `go run .../cmd/wf` 报 `missing go.sum entry` | 只 `go get` 了库 | `go get -tool .../cmd/wf` |
+
+完整排错表见 [接入指南](docs/GUIDE.md)。
 
 ### `webfront.Renderer`（引擎抽象）
 
@@ -252,7 +306,7 @@ type Head struct {
 ### 自编译入口：`compiler.New`
 
 ```go
-eng, err := compiler.New(webfront.Config{RootDir: "./web", Mode: webfront.ModeSSR}, 4)
+eng, err := compiler.New(webfront.Config{RootDir: "./web"}, 4)
 ```
 
 启动时现场构建 SSR bundle 并起引擎，适合"单机自编译"的工具型程序。生产部署不建议用它——那会把 esbuild（+4.35MB）一起链进二进制，正确做法是构建期用 `wf build` 出 `ssr.js`，运行期 `//go:embed` 进来。
@@ -268,8 +322,12 @@ eng, err := compiler.New(webfront.Config{RootDir: "./web", Mode: webfront.ModeSS
 mux.Handle("/assets/", eng.StaticHandler())
 mux.Handle("/", eng)
 
+// 混合：SSR 为默认，/app/ 子路径走纯客户端 SPA（同一个 engine、同一份产物）
+mux.Handle("/app/", eng.SPAHandler())
+
 // Gin —— 两行接入即可；挂子路径时加一层 r := r.Group("/site") 再剥前缀，或用 Config.BasePath
 r.GET("/assets/*filepath", gin.WrapH(eng.StaticHandler()))
+r.GET("/app/*filepath", gin.WrapH(eng.SPAHandler()))
 r.NoRoute(gin.WrapH(eng))
 
 // Echo
@@ -288,25 +346,90 @@ r.Handle("/*", eng)
 
 ## CLI
 
+> **`wf` 是构建期工具，不是运行时依赖。** 它不进你的服务二进制，也不在你的构建图里；
+> 存在的唯一理由是把 `install → build → prerender` 这套一次性工序收成几条命令，
+> 免得每个项目重写一遍。不用它也完全可以——每个子命令都有等价的库 API（见下）。
+
+它和库在同一个模块里，所以不需要单独下载；但 Go 不会像 npm 的 `node_modules/.bin`
+那样替你把命令放进 PATH，初次使用要选一种获取方式：
+
+| 方式 | 之后怎么调用 | 适用 |
+| --- | --- | --- |
+| `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
+| `go install github.com/plunjoin/webfront/cmd/wf@main` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@main` | 直接跑 | 一次性使用，不登记任何东西（v0.1.2 发版后把 `@main` 换成 `@v0.1.2`） |
+
+> 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
+> `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
+> `missing go.sum entry`。上表第一种方式会顺带登记这些依赖。
+
 ```bash
-wf build   [-modules <dir>] [-split] [-prerender routes.json] [-base <path>] [-out <dir>] [-mode <ssr|spa>] [rootDir]
-wf install [-modules <dir>] [rootDir]
-wf dev     [-tags dev] [-run "dev"] [-watch <dir>] [-ldflags "..."] [appDir]
+wf install [rootDir]
+wf build   [rootDir]        # 可选：-modules -split -prerender -base -out -mode（ssr|spa|template）
+wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 ```
+
+**日常不用传任何参数**，两个自动探测：
+
+| 探测 | 规则 |
+| --- | --- |
+| 依赖目录（`-modules auto`） | 优先用已有 `.store/manifest.json` 的 `wf_modules` / `node_modules`；其次用已存在的目录；都没有才落到 `wf_modules` |
+| 预渲染（`-prerender auto`） | 存在 `<webDir>/routes.json` 就启用；`-prerender -` 可关闭 |
+
+### 参数
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `rootDir` | `.` | 包含 `web/` 的目录；直接指向 `web/` 也行 |
-| `-modules` | `node_modules` | 依赖目录名；非 `node_modules` 时自动作为 esbuild 的 `NodePaths` |
-| `-split` | `true` | 客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE |
-| `-prerender` | — | `routes.json` 路径，额外产出 `dist/pages/*.html`（运行期可零 JS 引擎） |
+| `-modules` | `auto` | 依赖目录名；显式指定后不探测。非 `node_modules` 时自动作为 esbuild 的 `NodePaths` |
+| `-split` | `true` | 客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE（入口 import CSS 时不要关：非 split 路径只写 JS，CSS 会丢） |
+| `-prerender` | `auto` | 存在 `<web>/routes.json` 就额外产出 `dist/pages/*.html`（运行期可零 JS 引擎）；传 `-` 关闭 |
 | `-base` | `/` | 部署前缀（如 `/site` 或 `/admin`）；资源路径与外壳 HTML 会自动带上 |
 | `-out` | `<webDir>/dist` | 产物输出目录（支持多前端子工程输出到独立子目录） |
-| `-mode` | `ssr` | 构建模式：`ssr`（默认全功能输出）或 `spa`（纯客户端 SPA，跳过 SSR 编译） |
+| `-mode` | `ssr` | 构建模式：`ssr`（默认全功能输出）、`spa`（纯客户端 SPA，跳过 SSR）或 `template`（只产 `ssr.js`，给 goja 当模板引擎用） |
 | `-tags` | `dev` | `wf dev`：`go build -tags`；置空则不带 tag |
 | `-run` | `dev` | `wf dev`：传给应用的参数（即 `go run -tags dev . dev` 里的那个 `dev`），置空则不带参数 |
 | `-watch` | `go.mod` 所在目录 | `wf dev`：监听根目录；默认整个模块，改子包也会重启 |
 | `-ldflags` | — | `wf dev`：透传给 `go build` |
+
+### 不想用 CLI？
+
+`wf` 只是把下面这些调用串起来，直接写 Go 一样能做：
+
+| 子命令 | 等价的库 API |
+| --- | --- |
+| `wf install` | `compiler.InstallStore` |
+| `wf build`（SSR） | `compiler.BuildSSRWith` |
+| `wf build`（客户端） | `compiler.BuildClientSplit` / `BuildClientWith` |
+| `wf build -prerender` | `compiler.ReadRoutes` + `PrerenderWithBase` |
+| `wf dev` | `dev.Supervise`（或自己起 `dev.NewDevServer`） |
+
+### 嵌入自己的工具入口（可选）
+
+如果不想用 `tool` 指令、也不想动 PATH，可以在自己的 `tools/` 里放一个 3 行入口
+（CI 里 `go run ./tools/wf` 即可）。CLI 逻辑是可导入的，`cmd/wf` 本身只剩这几行：
+
+```go
+// tools/wf/main.go
+package main
+
+import (
+	"os"
+
+	"github.com/plunjoin/webfront/cli"
+)
+
+func main() { os.Exit(cli.Run(os.Args[1:])) }
+```
+
+`cli.Run` 不调用 `os.Exit`，只返回退出码，嵌进别人进程里也安全（参数写错返回 2，
+不会把宿主带走）。
+
+> `cli` 包不在 v0.1.1 及更早版本里；使用这些版本时直接用 `go tool wf` 即可
+> （`cmd/wf` 在 v0.1.1 里已经能工作）。
+
+> **构建期依赖不会进线上二进制**：`tool` 指令和 `tools/wf` 都只是构建期依赖。
+> 你的服务 `main` 不 import CLI，`go list -deps .` 里就看不到 esbuild / goja / fsnotify。
 
 `routes.json`：
 
@@ -331,7 +454,7 @@ web/wf_modules/.store/manifest.json
 
 ```bash
 cd _examples/basic
-wf dev            # 等价于 go run -tags dev . dev，但改 .go 会自动重启
+wf dev            # 前端 HMR 同 go run -tags dev . dev；额外负责改 .go 自动重启
 ```
 
 Go 进程里的机器码换不掉，所以这里不是"热替换"，而是**重编译 + 换进程**——但把换的过程做得没有存在感：
@@ -417,7 +540,7 @@ export async function render(url: string, props: Record<string, any>) {
 | --- | --- | --- |
 | goja 不支持 `async function*` / `Intl` | 个别依赖可能跑不动 | SSR 产物统一降级到 ES2017（esbuild `Target`），`ssr.js` 只大 0.5% |
 | 无流式 SSR | 不支持 `renderToPipeableStream` + Suspense | 当前全走同步 `renderToString` |
-| `ModeIslands` 尚未实现 | 孤岛水合不可用（`ModeSPA` 的文件直出 + index.html fallback 已实现） | 用 `ModeSSR` + 预渲染替代 |
+| `ModeIslands` 尚未实现 | 孤岛水合不可用；显式设置时退化为 SSR，自动识别不会选它 | 用 SSR + 预渲染替代 |
 | 预渲染内容构建期固定 | 动态数据进不去 | 动态页面用 `-tags dynamic`，或客户端补 |
 | `lang="stylus"` / `lang="pug"` 无对应预处理器 | 这两类 SFC 编译不过 | 先手动编译成 css / html，或换 scss、less |
 | `wf dev` 的 Go 热更是"重启进程" | 重启窗口（2–3s）内请求会失败 | 只用于开发；线上靠多副本滚动更新 |
@@ -435,8 +558,9 @@ webfront/
 ├── jsruntime/                运行期：goja 引擎池
 ├── dev/                      开发态：转译 + HMR
 ├── devui/                    开发态错误界面：覆盖层 + 错误页（纯标准库）
-├── cmd/wf/                   极薄 CLI
-├── _examples/basic/          可运行示例（三形态）
+├── cli/                      CLI 逻辑（可导入；版本随使用者的 go.mod 走）
+├── cmd/wf/                   极薄入口：os.Exit(cli.Run(os.Args[1:]))
+├── _examples/basic/          可运行示例（四形态）
 └── ARCHITECTURE.md           设计文档：为什么这么选、怎么验证的
 ```
 
@@ -447,19 +571,21 @@ webfront/
 ## 跑一遍示例
 
 ```bash
-# 1) 构建前端产物
-go run ./cmd/wf install -modules wf_modules ./_examples/basic
-go run ./cmd/wf build -modules wf_modules \
-    -prerender _examples/basic/web/routes.json ./_examples/basic
+# 1) 构建前端产物（依赖目录与 routes.json 都自动探测）
+go run ./cmd/wf install ./_examples/basic
+go run ./cmd/wf build ./_examples/basic
 
-# 2) 三种形态任选
+# 2) 形态任选
 cd _examples/basic
 go run .                       # 静态，7.0MB
 go run -tags dynamic .         # 动态 SSR，15.6MB
 go run -tags dev . dev         # 开发服务器（改 web/src 即热更）
 
-# 3) 开发模式（推荐）：前端 HMR + 改 .go 自动重启
-go run ../cmd/wf dev .         # 或安装后直接 wf dev
+# 纯 SPA：回仓库根重建 SPA 产物，再 go run .
+# go run ./cmd/wf build -mode spa ./_examples/basic
+
+# 3) 开发模式（推荐）：前端 HMR + 改 .go 自动重启（仓库根执行）
+go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf dev
 ```
 
 细节见 [`_examples/basic/README.md`](_examples/basic/README.md)。
@@ -468,12 +594,26 @@ go run ../cmd/wf dev .         # 或安装后直接 wf dev
 
 ## 状态
 
-v0.1.0，已实现并端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.1 已发布；当前工作区还包含下一版的未发布改动（见下方 changelog）。以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### 未发布（下一版）
+
+- **React/Vue 当模板引擎**：`wf build -mode template` 只产 `ssr.js`；运行期 `RenderTemplate` / `RenderTemplateTo` 直接接收 struct / map
+- **零配置形态识别**：`Config.Mode` 可省略，按 `Renderer` → `pages/*.html` → `index.html` 自动判动态 SSR / 静态 / SPA
+- **`SPAHandler()`**：同一个 engine 同时提供 SSR 与某个 SPA 子路径
+- **构建清理**：`wf build` 删除本次不再产出的 `ssr.js` / `pages/`（预渲染 0 个页面也算未产出；仅限 `web/dist` 这类工程内输出目录），避免旧产物把自动识别带偏
+
+### v0.1.1 相对 v0.1.0
+
+- **`Render` 错误响应**：渲染失败时自己写 500（生产纯文本 / 开发错误页），调用方不用再写 fallback
+- **`wf dev`**：改 `.go` 自动重编译重启，浏览器自动恢复
+- **开发错误覆盖层**：前端编译 / 浏览器异常 / Go 重启 / SSR 失败都进前台
+- **构建期错误**：esbuild 渲染器带 code frame
 
 ### v0.1.0 相对 v0.0.1
 

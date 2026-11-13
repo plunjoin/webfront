@@ -20,8 +20,8 @@ func newEngine() (*webfront.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 不写 Mode：有 Renderer → 自动识别为动态 SSR。
 	return webfront.New(webfront.Config{
-		Mode:     webfront.ModeSSR,
 		Renderer: pool,
 		EmbedFS:  distFS,
 		DistDir:  "web/dist",

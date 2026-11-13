@@ -10,8 +10,8 @@ import (
 const modeDesc = "预渲染静态 · 无 JS 引擎"
 
 func newEngine() (*webfront.Engine, error) {
+	// 不写 Mode：dist 里有 pages/ → 自动识别为预渲染/静态。
 	return webfront.New(webfront.Config{
-		Mode:    webfront.ModeSSR,
 		EmbedFS: distFS,
 		DistDir: "web/dist",
 	})
