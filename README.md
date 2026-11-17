@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.2（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 都是 v0.1.2 新增。
+> **文档对应 v0.1.3（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.2
+go get github.com/plunjoin/webfront@v0.1.3
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@main
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.3
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@main` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.2` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.3` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.3` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -593,12 +593,20 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.2 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.3 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### v0.1.3 相对 v0.1.2
+
+- **导入别名**：默认 `@/ → src/`（`src/` 存在时），并读取 `tsconfig.json` / `jsconfig.json` 的 `compilerOptions.paths`（含 `extends` / `references`）。`wf build` 与 `wf dev` 使用同一套映射；`wf dev` 通过 import map 交给浏览器解析
+- **`wf dev` 服务别名目标**：别名指向 `src/` 之外的项目内文件时走 `/@fs/`，越出项目根目录的路径一律拒绝
+- **HMR 路径对齐**：广播的 URL 与 import map 使用同一套映射（`src/` → `/src/`，其余 → `/@fs/`），别名文件改动也能正确热更新
+- **npm 子路径解析**：子目录自带 `package.json` 时按其 `exports` / `module` / `main` 解析（如 `react-remove-scroll-bar/constants`），最后才回退 `index.*`
+- **dev 扩展名**：新增 `.mjs` / `.cjs` 的按需转译与扩展名补全
 
 ### v0.1.2 相对 v0.1.1
 

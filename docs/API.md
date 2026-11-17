@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.2 工作区）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.3）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -429,7 +429,14 @@ func PageFile(url string) string {
 
 ## 10. 版本差异
 
-### v0.1.1 → v0.1.2（工作区）：配置简化 + SSR/SPA 共存
+### v0.1.2 → v0.1.3：导入别名与子路径解析
+
+- 新增 `compiler.LoadAliases` / `ResolveAlias` / `AliasPlugin`：默认 `@/ → src/`，并读取 `tsconfig.json` / `jsconfig.json` 的 `compilerOptions.paths`（含 `extends` / `references` 链）；`wf build` 与 `wf dev` 共用。
+- `wf dev` 把别名写进 `index.html` 的 import map；别名指向 `src/` 之外的路径时通过 `/@fs/` 提供，只允许项目目录内的文件。
+- `wf dev` 的 HMR 广播与 import map 使用同一套 URL 映射；`.mjs` / `.cjs` 也支持按需转译。
+- `resolveSubpath` 支持"子目录自带 `package.json`"的包（如 `react-remove-scroll-bar/constants`）：按该子目录的 `exports` / `module` / `main` 解析，最后回退 `index.*`。
+
+### v0.1.1 → v0.1.2：配置简化 + SSR/SPA 共存
 
 - `Config.Mode` 可省略：按 `Renderer` → `pages/*.html` → `index.html` 自动解析；显式值仍然优先。
 - 新增 `Engine.SPAHandler()`：同一个 engine 可以 SSR 为主，同时给某个子路径提供 SPA fallback。
@@ -464,7 +471,7 @@ v0.1.0 的 `Render` 在渲染失败时只返回 error，不写响应；调用方
 | 自动识别靠产物 | `dist` 里残留的 `pages/*.html` 会把形态判成静态；`wf build` 会清理固定产物，手动塞入的文件需自己清，或显式写 `Mode` |
 | 构建只清理固定产物 | 在前端工程内部的输出目录里，`ssr.js` / `pages/` / template 下的 `index.html` / `assets/` 会被清理；`-out` 指到工程根或工程外时跳过清理，用户自己放进 `dist` 的其他旧文件仍会被 embed |
 | 无 `public/` 拷贝 | 静态文件需构建后自己放进 `dist/` |
-| 无 Vite 式 aliases / `import.meta.env` / PostCSS | `tsconfig` 的 `paths` 只在 `wf build` 生效，`wf dev` 不解析；见 [接入指南 §8](GUIDE.md) |
+| 无 Vite 配置 / `import.meta.env` / PostCSS | 别名内置：默认 `@/ → src/`，并读取 `tsconfig` 的 `paths`（`wf build` 与 `wf dev` 一致）；没有 `vite.config` 可配其他别名，见 [接入指南 §8](GUIDE.md) |
 | 无目录列表 / Range | `StaticHandler` 只做整文件 + ETag + gzip |
 | 单次渲染默认 5s 超时 | `jsruntime.NewWithTimeout` / `Pool.SetTimeout` 可调 |
 | 预渲染内容固定 | 动态数据只能客户端补或改用动态 SSR |

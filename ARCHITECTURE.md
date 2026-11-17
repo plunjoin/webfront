@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.2（工作区）已实现并验证**（v0.1.1 已发布；§1.5 / §3.2.1 为 v0.1.2 新增）。最后更新：2026-11-14。
+> **状态：v0.1.3 已实现并验证**（v0.1.2 已发布；§4.6 别名解析、§7.1 `/@fs/` 为 v0.1.3 新增）。最后更新：2026-11-17。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.2（工作区） |
+| 维度 | 草案 v0 | 现状 v0.1.3 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **6 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cli` / `cmd/wf`） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -91,6 +91,7 @@ webfront/
 │   ├── prerender.go       ReadRoutes · Prerender · PageFile
 │   ├── install.go         InstallStore（lockfile 驱动的纯 Go 安装器）
 │   ├── store.go           版本化 store 解析（manifest.json）
+│   ├── alias.go           导入别名（@/、tsconfig paths）+ 源码路径补全
 │   ├── vue.go             @vue/compiler-sfc 的 esbuild 插件
 │   └── preprocess.go      <style lang="scss|sass|less"> 的纯 Go 预处理器
 ├── jsruntime/           运行期：JS 引擎池（goja）
@@ -409,7 +410,30 @@ web/wf_modules/
 >
 > **现代 npm 包 `exports` 解析支持**：针对 Vue 3、Tailwind、React Router 等现代 ESM 包缺失根 `module` 或依赖条件导出的场景，解析器优先读取 `package.json` 中的 `exports` 规范（按 `"import" > "browser" > "module" > "default"` 优先级匹配条件），并支持精确子路径与通配符模式匹配（`./*`）。
 >
+> **子目录自带 `package.json` 的子路径**：有些包用"子目录 + 独立 package.json"声明入口（如 `react-remove-scroll-bar/constants` 里的 `{"main": "../dist/es5/constants.js", "module": "../dist/es2015/constants.js"}`）。子路径解析在补扩展名失败后，会按该子目录自己的 `exports`/`module`/`main` 解析，最后才回退 `index.*`。
+>
 > **16 协程并发下载加速**：`InstallStore` 采用带缓冲信号量的并发 Worker 池（限制 16 并发），大幅缩短海量依赖下载解压耗时。
+
+### 4.6.1 导入别名（alias.go）
+
+`LoadAliases` 在构建与 dev 启动时读一次配置，产出按**最长前缀**排序的 `[]Alias`：
+
+| 来源 | 规则 |
+| --- | --- |
+| 约定 | `src/` 存在时默认 `@/ → <root>/src/`；有显式 `@/*` 时以显式配置为准 |
+| `tsconfig.json` / `jsconfig.json` | `compilerOptions.paths`，值相对 `baseUrl`（未设置时相对配置文件目录） |
+| `extends` / `references` | 递归展开；父配置先写入，子配置后写入覆盖 |
+| JSONC | 允许 `//` / `/* */` 注释与尾逗号 |
+
+`"@ui/*": ["./ui/*"]` 变成前缀别名（`Prefix` 保留尾斜杠），精确键变成精确别名。
+只保留第一个目标；import map 与前缀匹配都表达不了中间通配，这类条目直接跳过。
+
+`AliasPlugin` 把命中别名的 specifier 解析成绝对路径后交回 esbuild；解析不到具体文件则不接管，
+让 esbuild 报出原始 specifier 的错。esbuild 本身会读 `tsconfig` `paths`，插件存在的意义是
+补上它不认识的约定 `@/`，并保证 dev 使用同一张表。
+
+`ResolveSourceFile` 是 dev / build 共用的无扩展名补全：原路径 → 路径+扩展名 →
+路径/`index.*`，顺序 `.tsx .ts .jsx .js .mjs .cjs .vue .css .json`（`.vue` 在 `.css` 前）。
 
 ### 4.7 SSG 预渲染（prerender.go）
 
@@ -606,6 +630,7 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 | --- | --- |
 | `GET /` | 返回注入 HMR 客户端（含错误覆盖层）的 HTML 骨架 |
 | `GET /src/*` | 读源文件 → `esbuild.Transform`（毫秒级）→ 返回 ESM |
+| `GET /@fs/*` | 别名指向 `src/` 之外的项目内文件；越出项目根目录一律 400 |
 | `GET /@deps/*` | 按需打包 npm 裸模块为 ESM 并内存缓存（配合 ImportMap 极速裸导入） |
 | `GET /__wf_hmr` | 升级 WebSocket，推送变更事件 |
 | `GET /__wf_ping` | 204 + `no-store`；Go 进程重启期间浏览器靠它判断"服务回来了没有" |
@@ -625,6 +650,11 @@ esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 
 「原路径 → 路径+`.tsx|.ts|.jsx|.js|.vue|.css|.json` → 路径/`index.*`」补全。
 不补的话，任何带相对导入的工程一进 dev 就 404 —— 而且浏览器只会回一句
 `Failed to fetch dynamically imported module`，看不出是哪个文件。
+
+**导入别名**：dev 期不做模块解析，`@/` 与 `tsconfig` `paths` 由 `compiler.LoadAliases`
+在启动时读一次（改配置需重启），写进 `index.html` 的 import map。前缀别名保持尾斜杠，
+精确别名若指向目录也补尾斜杠；`src/` 内的目标映射到 `/src/`，其余项目内目标映射到
+`/@fs/`。HMR 广播复用同一套映射，否则别名文件的 update 事件会让浏览器请求到错误 URL。
 
 ### 7.2 HMR 协议
 

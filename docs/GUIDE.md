@@ -4,7 +4,7 @@
 > 每个方法写不写响应、返回什么状态码、缓存头是什么，见 [API 契约](API.md)。
 > 遇到报错直接跳到 [§10 排错](#10-排错按现象查)。
 
-> **本文对应 v0.1.2（工作区，尚未发版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 都是 v0.1.2 新增，v0.1.1 没有。这些改动发布到 main 之前，安装命令仍会拿到 v0.1.1。
+> **本文对应 v0.1.3**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增，更早版本没有。
 
 ## 先看这个：React/Vue 当 Go 的模板引擎
 
@@ -233,8 +233,7 @@ cd ..
 > `--package-lock-only` 不会创建 `node_modules`，正合适；如果你已经 `npm install` 过，直接复用现有 lockfile 也行。
 
 ```bash
-# v0.1.2 尚未发版：先用 main；发版后换成 @v0.1.2
-go get github.com/plunjoin/webfront@main
+go get github.com/plunjoin/webfront
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 go tool wf install          # 读 web/package-lock.json，物化到 web/wf_modules/.store/
@@ -844,7 +843,7 @@ ENTRYPOINT ["/app"]
 | Vite 里的东西 | webfront 对应 | 说明 |
 | --- | --- | --- |
 | `vite.config.ts` | **没有** | 构建参数走 CLI flags；运行期参数走 `webfront.Config` |
-| `resolve.alias` | **没有 Vite 式配置** | `tsconfig.json` 的 `paths` / `baseUrl` 在 `wf build` 里会被 esbuild 自动识别并生效；但 `wf dev` 的逐文件 Transform 不解析别名。为了开发/生产一致，建议用相对路径或包名 |
+| `resolve.alias` | **内置 `@/ → src/`，并读取 `tsconfig` paths** | 不需要 `vite.config`：默认 `@/foo` 指向 `<web>/src/foo`；`tsconfig.json` / `jsconfig.json` 的 `compilerOptions.paths`（含 `extends` / `references`）在 `wf build` 与 `wf dev` 都生效。`paths` 支持前缀通配（`"@ui/*"`）与精确键；目标必须在项目目录内，`wf dev` 通过 import map + `/@fs/` 提供 |
 | `define` / `import.meta.env` | 仅 `process.env.NODE_ENV` | 没有 `.env` 注入；运行期配置用 `Props` 或后端注入 |
 | `public/` | **没有自动拷贝** | 构建后把静态文件复制进 `dist/`（`embed` 会一起带上） |
 | PostCSS / Tailwind | **没有内置管线** | 先用 Tailwind CLI / PostCSS 生成 `.css`，再当普通 CSS import |
@@ -859,7 +858,7 @@ ENTRYPOINT ["/app"]
 | 动态 `import()` | 仅有限支持 | 表达式能被静态分析时（如模板字符串 glob）esbuild 会打包匹配文件；完全动态的表达式可能保留到运行期。不要依赖 Vite 的 glob 语义 |
 | TypeScript 类型检查 | **不做** | esbuild 只剥类型；需要时自己跑 `tsc --noEmit` |
 
-`tsconfig.json` 值得保留：IDE 和 `tsc --noEmit` 靠它做类型检查；`wf build` 也会让 esbuild 自动读取其中的 `paths` / `baseUrl`。但 `wf dev` 不解析这些别名，**跨开发/生产最稳的做法仍是相对路径或包名**。类型检查本身不由 `wf build` 执行，需要单独跑 `tsc --noEmit`。
+`tsconfig.json` 值得保留：IDE 和 `tsc --noEmit` 靠它做类型检查；`paths` 里的别名会被 `wf build` 和 `wf dev` 同时识别（`wf dev` 在启动时读取，改完 `tsconfig` 需重启）。即使没有 tsconfig，`@/` 也默认指向 `src/`，所以从 Vue CLI / Nuxt / 常见 Vite 模板迁过来的 `@/components/Foo` 可以直接用。别名目标必须位于项目目录内；`wf dev` 只从 `src/` 与别名指向的项目内路径读文件。类型检查本身不由 `wf build` 执行，需要单独跑 `tsc --noEmit`。
 
 ---
 
