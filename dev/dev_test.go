@@ -295,3 +295,133 @@ func TestDevServeSrcResolvesExtension(t *testing.T) {
 		}
 	}
 }
+
+// dev 不做模块解析：别名必须写进 import map，浏览器才能把 "@/x" 解析到 /src/x。
+func TestDevAliasImportMap(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	if err := os.MkdirAll(filepath.Join(src, "widgets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "widgets", "Button.tsx"),
+		[]byte(`export default function Button() { return <button>ok</button> }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 额外一条前缀别名，验证 tsconfig paths 也会进 import map。
+	if err := os.WriteFile(filepath.Join(tmp, "tsconfig.json"), []byte(`{
+  // 注释与尾逗号都要能读
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@components/*": ["./src/widgets/*"],
+      "@config": ["./src/config.ts"],
+    },
+  },
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := NewDevServer(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := ds.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / = %d", rec.Code)
+	}
+	html := rec.Body.String()
+	for _, want := range []string{
+		`"@/": "/src/"`,
+		`"@components/": "/src/widgets/"`,
+		`"@config": "/src/config.ts"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("import map 缺少 %s:\n%s", want, html)
+		}
+	}
+
+	// 别名解析出来的 URL 必须真的能被 dev server 提供（含无扩展名补全）。
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/src/widgets/Button", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /src/widgets/Button = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "button") {
+		t.Fatalf("Button 没有编译成 JS: %s", rec.Body.String())
+	}
+}
+
+// 别名指向 src/ 之外时走 /@fs/，并且不允许越出项目根目录。
+func TestDevAliasServesProjectFiles(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "shared", "util.ts"),
+		[]byte(`export const shared = "from-shared"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "tsconfig.json"), []byte(`{
+  "compilerOptions": { "paths": { "@shared/*": ["./shared/*"] } }
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 项目根之外的文件：即使路径穿越也不该被读到。
+	outside := filepath.Join(filepath.Dir(tmp), "wf-alias-outside.txt")
+	if err := os.WriteFile(outside, []byte("TOP-SECRET-CONTENT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	ds, err := NewDevServer(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := ds.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !strings.Contains(rec.Body.String(), `"@shared/": "/@fs/shared/"`) {
+		t.Fatalf("import map 缺少 @shared/ 映射:\n%s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/@fs/shared/util", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /@fs/shared/util = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "from-shared") {
+		t.Fatalf("/@fs 没有返回别名目标: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/@fs/../wf-alias-outside.txt", nil))
+	if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), "TOP-SECRET-CONTENT") {
+		t.Fatalf("路径穿越不应读到项目根之外: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// HMR 广播与 import map 必须用同一套 URL 映射：src/ → /src/，其余项目内文件 → /@fs/。
+func TestDevURLMapping(t *testing.T) {
+	root := t.TempDir()
+	ds := &DevServer{root: root}
+	cases := []struct {
+		rel  string
+		want string
+		ok   bool
+	}{
+		{"src/App.tsx", "/src/App.tsx", true},
+		{"src/widgets/Button.vue", "/src/widgets/Button.vue", true},
+		{"shared/util.ts", "/@fs/shared/util.ts", true},
+		{"../outside.ts", "", false},
+	}
+	for _, c := range cases {
+		got, ok := ds.devURL(filepath.Join(root, filepath.FromSlash(c.rel)))
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("devURL(%s) = (%q, %v)，期望 (%q, %v)", c.rel, got, ok, c.want, c.ok)
+		}
+	}
+}

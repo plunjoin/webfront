@@ -291,7 +291,12 @@ func resolveExportSubpath(exports any, sub string) string {
 	return ""
 }
 
-// resolveSubpath 在包目录内解析子路径（优先支持 package.json 的 exports，回退补扩展名 / index 文件）。
+// resolveSubpath 在包目录内解析子路径：
+//  1. 包 package.json 的 exports（精确 / 通配符）
+//  2. 当作文件补扩展名
+//  3. 当作目录：目录自带 package.json 时按它的 exports/module/main 解析
+//     （如 react-remove-scroll-bar/constants 里的 {"module": "../dist/es2015/constants.js"}），
+//     否则回退 index 文件
 func resolveSubpath(dir, sub string) string {
 	if pkg, ok := readPackageJSON(dir); ok && pkg.Exports != nil {
 		if target := resolveExportSubpath(pkg.Exports, sub); target != "" {
@@ -302,7 +307,19 @@ func resolveSubpath(dir, sub string) string {
 		}
 	}
 	base := filepath.Join(dir, filepath.FromSlash(sub))
-	return resolveFileWithExt(base)
+	if resolved := resolveFileWithExt(base); resolved != "" {
+		return resolved
+	}
+	// 子目录自带 package.json：按它自己的入口字段解析（目标可指向包内其他目录，
+	// filepath.Join 会自然清理 ".."）。packageEntry 已包含 exports → module/main → index.js。
+	if fi, err := os.Stat(base); err == nil && fi.IsDir() {
+		if _, ok := readPackageJSON(base); ok {
+			if entry := packageEntry(base); entry != "" {
+				return entry
+			}
+		}
+	}
+	return ""
 }
 
 // ownerPackage 从 importer 的绝对路径反推 store 里的 "<name>@<version>"。

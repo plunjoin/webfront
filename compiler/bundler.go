@@ -71,7 +71,7 @@ func BuildSSRWith(rootDir, entry, modulesDir string) ([]byte, error) {
 		EntryPoints:   []string{entry},
 		AbsWorkingDir: abs,
 		NodePaths:     modulesNodePaths(rootDir, modulesDir),
-		Plugins:       append(storePlugins(rootDir, modulesDir), VuePlugin(rootDir, modulesDir)),
+		Plugins:       buildPlugins(rootDir, modulesDir),
 		Define:        map[string]string{"process.env.NODE_ENV": "\"production\""},
 		// SSR 产物跑在我们的 JS 引擎里，不是浏览器：统一降级到 ES2017，
 		// 让 async generator / 逻辑赋值等新语法由 esbuild 编译掉，
@@ -108,7 +108,7 @@ func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error)
 		AbsWorkingDir:     abs,
 		Outfile:           outfile,
 		NodePaths:         modulesNodePaths(rootDir, modulesDir),
-		Plugins:           append(storePlugins(rootDir, modulesDir), VuePlugin(rootDir, modulesDir)),
+		Plugins:           buildPlugins(rootDir, modulesDir),
 		Define:            map[string]string{"process.env.NODE_ENV": "\"production\""},
 		MinifyWhitespace:  true,
 		MinifyIdentifiers: true,
@@ -145,7 +145,7 @@ func BuildClientSplit(rootDir, entry, outDir, modulesDir string) ([]api.OutputFi
 	// 写进虚拟入口反而会因不在 manifest.Root 里而解析失败。
 	vendor = filterRootDeps(abs, modulesDir, vendor)
 
-	plugins := append(storePlugins(rootDir, modulesDir), VuePlugin(rootDir, modulesDir))
+	plugins := buildPlugins(rootDir, modulesDir)
 	plugins = append(plugins, virtualVendorPlugin(abs, vendor))
 
 	res := api.Build(api.BuildOptions{
@@ -242,7 +242,7 @@ func clientUsedPackages(abs, entry, modulesDir string) []string {
 		// outdir/outfile 才肯出多文件（Write:false 不落盘，这里只是占位）。
 		Outdir:    "wf-probe",
 		NodePaths: modulesNodePaths(abs, modulesDir),
-		Plugins:   append(storePlugins(abs, modulesDir), VuePlugin(abs, modulesDir)),
+		Plugins:   buildPlugins(abs, modulesDir),
 		Define:    map[string]string{"process.env.NODE_ENV": "\"production\""},
 		Metafile:  true,
 		LogLevel:  api.LogLevelSilent,

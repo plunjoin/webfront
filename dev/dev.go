@@ -35,6 +35,11 @@ type DevServer struct {
 	rootDeps   map[string]string
 	modulesDir string
 
+	// 导入别名（默认 @/ → src/，外加 tsconfig paths）。dev 期不做模块解析，
+	// 所以把它们写进 index.html 的 import map，交给浏览器完成解析。
+	// 启动时读取一次，之后只读；改 tsconfig 需要重启 dev server。
+	aliases []compiler.Alias
+
 	// 最近一次编译错误。浏览器 import() 失败时拿不到是哪个文件坏的
 	// （嵌套依赖只会抛一句 "Failed to fetch dynamically imported module"），
 	// 所以服务端留一份，客户端通过 /__wf_error?since=N 取回原文。
@@ -117,9 +122,17 @@ func NewDevServer(root string) (*DevServer, error) {
 		depsCache:  map[string][]byte{},
 		rootDeps:   rootDeps,
 		modulesDir: modulesDir,
+		aliases:    compiler.LoadAliases(abs),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
+	}
+	for _, a := range d.aliases {
+		if _, _, ok := d.aliasImport(a); !ok {
+			fmt.Printf("[alias] 跳过 %s（目标不在项目目录内，dev 无法提供）: %s\n", a.Prefix, a.Target)
+			continue
+		}
+		fmt.Printf("[alias] %s -> %s\n", a.Prefix, a.Target)
 	}
 	// fsnotify 不递归：必须把 src 下每一层子目录都加进监听，
 	// 否则改 src/components/Foo.vue 这种文件时 HMR 完全收不到事件。
@@ -184,11 +197,16 @@ func (d *DevServer) watch() {
 			continue
 		}
 		ext := filepath.Ext(ev.Name)
-		if ext == ".tsx" || ext == ".ts" || ext == ".vue" || ext == ".css" || ext == ".js" || ext == ".jsx" {
+		if ext == ".tsx" || ext == ".ts" || ext == ".vue" || ext == ".css" || ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs" {
+			// 用 devURL 而不是拼 "/"+相对路径：src/ 下的文件映射到 /src/，
+			// 别名指向的其他目录（shared/ 等）映射到 /@fs/，否则浏览器 import 会撞上 index.html。
+			url, ok := d.devURL(ev.Name)
+			if !ok {
+				continue
+			}
 			rel, _ := filepath.Rel(d.root, ev.Name)
-			rel = filepath.ToSlash(rel)
-			d.broadcast(map[string]any{"type": "update", "path": "/" + rel})
-			fmt.Printf("[HMR] changed %s -> broadcast to %d client(s)\n", rel, d.clientCount())
+			d.broadcast(map[string]any{"type": "update", "path": url})
+			fmt.Printf("[HMR] changed %s -> broadcast to %d client(s)\n", filepath.ToSlash(rel), d.clientCount())
 		}
 	}
 }
@@ -213,6 +231,9 @@ func (d *DevServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.serveIndex)
 	mux.HandleFunc("/src/", d.serveSrc)
+	// 别名指向 src/ 之外（tsconfig paths、@shared/* 等）时，从项目根目录提供服务。
+	// 只允许项目内的文件，避免 dev server 变成任意文件读取。
+	mux.HandleFunc("/@fs/", d.serveFS)
 	mux.HandleFunc("/@deps/", d.serveDeps)
 	mux.HandleFunc("/__wf_hmr", d.serveWS)
 	// 探活：Go 进程重启期间浏览器靠它判断"服务回来了没有"。
@@ -253,6 +274,13 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 		imports[pkg+"/"] = "/@deps/" + pkg + "/"
 	}
 	d.mu.Unlock()
+
+	// 别名放在依赖之后：同名时用户显式配置的别名优先于 npm 包。
+	for _, a := range d.aliases {
+		if key, val, ok := d.aliasImport(a); ok {
+			imports[key] = val
+		}
+	}
 
 	importMapJSON, _ := json.MarshalIndent(importMap, "  ", "  ")
 	importMapTag := ""
@@ -325,16 +353,77 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 	w.Write(code)
 }
 
-// serveSrc 按需单文件转译：读源码 → esbuild.Transform / Vue CompileSFC → 返回浏览器可 import 的产物。
+// aliasImport 把一个别名转成 import map 条目。
+// 前缀别名（"@/"）保持尾斜杠；精确别名若是目录也补尾斜杠。
+// 目标不在项目内时 ok=false —— dev server 不允许读出项目根目录。
+func (d *DevServer) aliasImport(a compiler.Alias) (key, url string, ok bool) {
+	u, ok := d.devURL(a.Target)
+	if !ok {
+		return "", "", false
+	}
+	if strings.HasSuffix(a.Prefix, "/") {
+		if !strings.HasSuffix(u, "/") {
+			u += "/"
+		}
+		return a.Prefix, u, true
+	}
+	if fi, err := os.Stat(a.Target); err == nil && fi.IsDir() && !strings.HasSuffix(u, "/") {
+		u += "/"
+	}
+	return a.Prefix, u, true
+}
+
+// devURL 把项目内的绝对路径映射成 dev server 的 URL：
+// src/ 下走 /src/（与入口一致），其余走 /@fs/（项目根相对）。
+func (d *DevServer) devURL(p string) (string, bool) {
+	abs := filepath.Clean(p)
+	if rel, ok := relWithin(filepath.Join(d.root, "src"), abs); ok {
+		if rel == "." {
+			return "/src/", true
+		}
+		return "/src/" + filepath.ToSlash(rel), true
+	}
+	if rel, ok := relWithin(d.root, abs); ok {
+		if rel == "." {
+			return "/@fs/", true
+		}
+		return "/@fs/" + filepath.ToSlash(rel), true
+	}
+	return "", false
+}
+
+// relWithin 判断 p 是否在 base 内，返回相对路径（".", "..", 绝对路径都视为不在内）。
+func relWithin(base, p string) (string, bool) {
+	rel, err := filepath.Rel(base, p)
+	if err != nil || filepath.IsAbs(rel) {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+// serveSrc 按需单文件转译 /src/ 下的文件。
+func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
+	d.serveURL(w, r, "/src/", filepath.Join(d.root, "src"))
+}
+
+// serveFS 服务别名指向的项目内文件（/@fs/<相对项目根的路径>）。
+func (d *DevServer) serveFS(w http.ResponseWriter, r *http.Request) {
+	d.serveURL(w, r, "/@fs/", d.root)
+}
+
+// serveURL 按需单文件转译：读源码 → esbuild.Transform / Vue CompileSFC → 返回浏览器可 import 的产物。
 //   - .ts/.tsx/.js/.jsx：转译为标准 ESM JS
 //   - .css：用 esbuild 转成"导入即注入 <style>"的 ESM 模块（支持 @import / url()）
 //   - .vue：通过 compiler.CompileSFC 编译单文件组件（包含模板、脚本与样式注入）
-func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
-	rel := strings.TrimPrefix(r.URL.Path, "/src/")
-	// path.Clean("/"+rel) 把 ../ 收敛到根内，避免 filepath.Join 被逃逸出 src/。
+func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, baseDir string) {
+	rel := strings.TrimPrefix(r.URL.Path, urlPrefix)
+	// path.Clean("/"+rel) 把 ../ 收敛到根内，避免 filepath.Join 被逃逸出 baseDir。
 	rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
-	full := filepath.Join(d.root, "src", filepath.FromSlash(rel))
-	if !strings.HasPrefix(full, filepath.Join(d.root, "src")+string(filepath.Separator)) {
+	full := filepath.Join(baseDir, filepath.FromSlash(rel))
+	if _, ok := relWithin(baseDir, full); !ok {
 		http.Error(w, "bad path: "+rel, http.StatusBadRequest)
 		return
 	}
@@ -342,28 +431,28 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 文件不存在也要记一笔：子模块 404 在浏览器侧同样只会得到
 		// "Failed to fetch dynamically imported module"，看不出是哪个文件。
-		body := "模块不存在：" + r.URL.Path + "\n\nwf dev 只服务 " +
-			filepath.ToSlash(filepath.Join(d.root, "src")) + " 下的文件。"
+		body := "模块不存在：" + r.URL.Path + "\n\nwf dev 服务 " +
+			filepath.ToSlash(filepath.Join(d.root, "src")) + " 以及别名指向的项目内文件。"
 		d.recordError(r.URL.Path, body)
 		http.Error(w, body, http.StatusNotFound)
 		return
 	}
 	// 补全后的真实路径才是 Sourcefile 该用的名字：浏览器请求 /src/App，
 	// 但错误里必须写 App.tsx，否则用户按行号找不到文件。
-	if r2, relErr := filepath.Rel(filepath.Join(d.root, "src"), full); relErr == nil {
+	if r2, relErr := filepath.Rel(baseDir, full); relErr == nil {
 		rel = filepath.ToSlash(r2)
 	}
-	srcURL := "/src/" + rel
+	srcURL := urlPrefix + rel
 	ext := filepath.Ext(full)
 	switch ext {
-	case ".tsx", ".ts", ".jsx", ".js":
+	case ".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs":
 		loader := api.LoaderTS
 		switch ext {
 		case ".tsx":
 			loader = api.LoaderTSX
 		case ".jsx":
 			loader = api.LoaderJSX
-		case ".js":
+		case ".js", ".mjs", ".cjs":
 			loader = api.LoaderJS
 		}
 		res := api.Transform(string(src), api.TransformOptions{
@@ -432,33 +521,21 @@ func (d *DevServer) serveSrc(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// srcExts 是"无扩展名导入"的补全顺序，与 esbuild 的 resolveExtensions 一致。
-var srcExts = []string{".tsx", ".ts", ".jsx", ".js", ".vue", ".css", ".json"}
-
 // readSrc 读源码文件，并按 Vite 的规则补全路径。
 //
 // 浏览器不做扩展名补全：`import App from './App'` 会原样请求 /src/App。
 // 构建期由 esbuild 解析，dev 期没人代劳，所以这里补：
-// 原路径 → 路径+扩展名 → 路径/index+扩展名。
+// 原路径 → 路径+扩展名 → 路径/index+扩展名（顺序与 build 共用）。
 func (d *DevServer) readSrc(full string) ([]byte, string, error) {
-	if b, err := os.ReadFile(full); err == nil {
-		return b, full, nil
+	p := compiler.ResolveSourceFile(full)
+	if p == "" {
+		return nil, full, os.ErrNotExist
 	}
-	if filepath.Ext(full) == "" {
-		for _, ext := range srcExts {
-			p := full + ext
-			if b, err := os.ReadFile(p); err == nil {
-				return b, p, nil
-			}
-		}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, p, err
 	}
-	for _, ext := range srcExts {
-		p := filepath.Join(full, "index"+ext)
-		if b, err := os.ReadFile(p); err == nil {
-			return b, p, nil
-		}
-	}
-	return nil, full, os.ErrNotExist
+	return b, p, nil
 }
 
 func (d *DevServer) serveWS(w http.ResponseWriter, r *http.Request) {

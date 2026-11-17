@@ -3,6 +3,7 @@ package compiler
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -90,5 +91,91 @@ func TestPackageEntryAndSubpathExports(t *testing.T) {
 	expectedEntry2 := filepath.Join(pkgDir2, "dist", "index.mjs")
 	if filepath.Clean(entry2) != filepath.Clean(expectedEntry2) {
 		t.Fatalf("expected entry2 %s, got %s", expectedEntry2, entry2)
+	}
+}
+
+// TestResolveSubpathWithNestedPackageJSON 覆盖 react-remove-scroll-bar/constants 这类
+// "子目录自带 package.json（指向包内其他目录）" 的包。
+func TestResolveSubpathWithNestedPackageJSON(t *testing.T) {
+	tmp := t.TempDir()
+	pkgDir := filepath.Join(tmp, "react-remove-scroll-bar")
+
+	for _, dir := range []string{
+		filepath.Join(pkgDir, "dist", "es5"),
+		filepath.Join(pkgDir, "dist", "es2015"),
+		filepath.Join(pkgDir, "constants"),
+		filepath.Join(pkgDir, "legacy"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(pkgDir, "package.json"),
+		`{"name":"react-remove-scroll-bar","main":"dist/es5/index.js","module":"dist/es2015/index.js"}`)
+	write(filepath.Join(pkgDir, "dist", "es5", "constants.js"), `export var K = "es5";`)
+	write(filepath.Join(pkgDir, "dist", "es2015", "constants.js"), `export var K = "es2015";`)
+	write(filepath.Join(pkgDir, "constants", "package.json"),
+		`{"private":true,"main":"../dist/es5/constants.js","module":"../dist/es2015/constants.js"}`)
+	// 没有 package.json 的普通目录，仍回退 index.js
+	write(filepath.Join(pkgDir, "legacy", "index.js"), `export var K = "legacy";`)
+
+	got := resolveSubpath(pkgDir, "constants")
+	want := filepath.Join(pkgDir, "dist", "es2015", "constants.js")
+	if filepath.Clean(got) != filepath.Clean(want) {
+		t.Fatalf("nested package.json subpath: expected %s, got %s", want, got)
+	}
+
+	gotLegacy := resolveSubpath(pkgDir, "legacy")
+	wantLegacy := filepath.Join(pkgDir, "legacy", "index.js")
+	if filepath.Clean(gotLegacy) != filepath.Clean(wantLegacy) {
+		t.Fatalf("plain directory index: expected %s, got %s", wantLegacy, gotLegacy)
+	}
+}
+
+// TestStoreResolverNestedPackageJSON 走完整 esbuild 解析链路，确认插件能解析
+// "包名/子目录"（子目录自带 package.json）形式的导入。
+func TestStoreResolverNestedPackageJSON(t *testing.T) {
+	tmp := t.TempDir()
+	appDir := filepath.Join(tmp, "app")
+	storeDir := filepath.Join(tmp, "wf_modules", ".store")
+	pkgDir := filepath.Join(storeDir, "react-remove-scroll-bar@2.3.8")
+
+	for _, dir := range []string{
+		filepath.Join(appDir, "src"),
+		filepath.Join(pkgDir, "dist", "es5"),
+		filepath.Join(pkgDir, "dist", "es2015"),
+		filepath.Join(pkgDir, "constants"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, content string) {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(pkgDir, "package.json"),
+		`{"name":"react-remove-scroll-bar","version":"2.3.8","main":"dist/es5/index.js","module":"dist/es2015/index.js"}`)
+	write(filepath.Join(pkgDir, "dist", "es5", "constants.js"), `export var K = "es5-constants";`)
+	write(filepath.Join(pkgDir, "dist", "es2015", "constants.js"), `export var K = "es2015-constants";`)
+	write(filepath.Join(pkgDir, "constants", "package.json"),
+		`{"private":true,"main":"../dist/es5/constants.js","module":"../dist/es2015/constants.js"}`)
+	write(filepath.Join(storeDir, "manifest.json"),
+		`{"root":{"react-remove-scroll-bar":"2.3.8"},"packages":{}}`)
+	write(filepath.Join(appDir, "src", "entry.js"),
+		`import { K } from 'react-remove-scroll-bar/constants'; console.log(K);`)
+
+	out, err := BuildSSRWith(appDir, "src/entry.js", "../wf_modules")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if !strings.Contains(string(out), "es2015-constants") {
+		t.Fatalf("bundle should come from nested package.json module field, got:\n%s", out)
 	}
 }
