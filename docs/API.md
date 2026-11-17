@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.3）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.4）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -428,6 +428,11 @@ func PageFile(url string) string {
 - 编译失败不杀旧进程；子进程 panic 退出后，改代码会重新拉起。
 
 ## 10. 版本差异
+
+### v0.1.3 → v0.1.4：tsconfig JSX 与 CJS 具名导出
+
+- 构建与 dev 的 esbuild 调用显式传入项目根 `tsconfig.json` / `jsconfig.json` 原文；别名插件解析出的 `.tsx` 也遵守 `jsx` 设置，不再退化为 `React.createElement`。
+- `wf dev` 的 `/@deps` 为 CommonJS 入口补具名导出；`import { useState } from "react"` 可直接使用，ESM 依赖与 `default` 导出行为不变。
 
 ### v0.1.2 → v0.1.3：导入别名与子路径解析
 

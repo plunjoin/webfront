@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.3（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增。
+> **文档对应 v0.1.4（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.3
+go get github.com/plunjoin/webfront@v0.1.4
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.3
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.4
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.3` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.3` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.4` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.4` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -593,12 +593,17 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.3 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.4 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### v0.1.4 相对 v0.1.3
+
+- **tsconfig JSX 不再丢失**：`wf build` 与 `wf dev` 都显式把项目根的 `tsconfig.json` / `jsconfig.json` 交给 esbuild；别名插件解析出的 `.tsx` 也能遵循 `jsx: react-jsx`，不再退化成 `React.createElement`
+- **dev 下 CJS 具名导入**：`/@deps` 为 CommonJS 入口补上可静态识别的具名导出，`import { useState } from "react"` 可直接在浏览器运行；`default` 导出行为不变，ESM 依赖不做改写
 
 ### v0.1.3 相对 v0.1.2
 

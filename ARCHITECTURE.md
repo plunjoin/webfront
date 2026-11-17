@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.3 已实现并验证**（v0.1.2 已发布；§4.6 别名解析、§7.1 `/@fs/` 为 v0.1.3 新增）。最后更新：2026-11-17。
+> **状态：v0.1.4 已实现并验证**（v0.1.3 已发布；v0.1.4 修复 tsconfig JSX 与 dev 下 CJS 具名导出）。最后更新：2026-11-17。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.3 |
+| 维度 | 草案 v0 | 现状 v0.1.4 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **6 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cli` / `cmd/wf`） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -432,6 +432,10 @@ web/wf_modules/
 让 esbuild 报出原始 specifier 的错。esbuild 本身会读 `tsconfig` `paths`，插件存在的意义是
 补上它不认识的约定 `@/`，并保证 dev 使用同一张表。
 
+esbuild 的 tsconfig 查找只覆盖它自己解析到的文件；插件直接返回绝对路径后，`jsx: react-jsx`
+之类的设置会丢失。`tsconfigRaw` 因此把项目根配置原文同时传给 SSR / client / split / 依赖探测
+构建，dev 的逐文件 `Transform` 也传入同一份原文。
+
 `ResolveSourceFile` 是 dev / build 共用的无扩展名补全：原路径 → 路径+扩展名 →
 路径/`index.*`，顺序 `.tsx .ts .jsx .js .mjs .cjs .vue .css .json`（`.vue` 在 `.css` 前）。
 
@@ -655,6 +659,11 @@ esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 
 在启动时读一次（改配置需重启），写进 `index.html` 的 import map。前缀别名保持尾斜杠，
 精确别名若指向目录也补尾斜杠；`src/` 内的目标映射到 `/src/`，其余项目内目标映射到
 `/@fs/`。HMR 广播复用同一套映射，否则别名文件的 update 事件会让浏览器请求到错误 URL。
+
+**CJS 具名导出**：`/@deps` 的 ESM 产物若来自 CommonJS 入口，`addCJSInterop` 会沿
+`module.exports = require_x()` 链扫描 `exports.foo` / `Object.defineProperty`，把能静态识别的
+名字补成 `export const`。这样 `import { useState } from "react"` 不需要改调用方；无法静态识别的
+导出保持 default-only，避免伪造绑定。
 
 ### 7.2 HMR 协议
 
