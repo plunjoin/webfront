@@ -404,6 +404,40 @@ func TestDevAliasServesProjectFiles(t *testing.T) {
 	}
 }
 
+// dev 是逐文件 Transform，esbuild 不会自己去读 tsconfig；不显式传原文的话
+// `jsx: react-jsx` 会退化成 React.createElement（浏览器里直接 ReferenceError）。
+func TestDevServeTSXUsesTSConfigJSX(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "tsconfig.json"),
+		[]byte(`{"compilerOptions":{"jsx":"react-jsx"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "src", "App.tsx"),
+		[]byte(`export default function App() { return <div>hi</div> }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := NewDevServer(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	ds.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/src/App.tsx", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /src/App.tsx = %d: %s", rec.Code, rec.Body.String())
+	}
+	code := rec.Body.String()
+	if strings.Contains(code, "React.createElement") {
+		t.Fatalf("dev 转译退化成 createElement（tsconfig 没生效）:\n%s", code)
+	}
+	if !strings.Contains(code, "react/jsx-runtime") {
+		t.Fatalf("dev 转译没有走 tsconfig 指定的 jsx-runtime:\n%s", code)
+	}
+}
+
 // HMR 广播与 import map 必须用同一套 URL 映射：src/ → /src/，其余项目内文件 → /@fs/。
 func TestDevURLMapping(t *testing.T) {
 	root := t.TempDir()

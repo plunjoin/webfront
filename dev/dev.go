@@ -35,6 +35,10 @@ type DevServer struct {
 	rootDeps   map[string]string
 	modulesDir string
 
+	// tsconfig.json 原文：esbuild 的 Transform 不会自动找 tsconfig，
+	// 不传的话 `jsx: react-jsx` 会退化成 React.createElement。
+	tsconfigRaw string
+
 	// 导入别名（默认 @/ → src/，外加 tsconfig paths）。dev 期不做模块解析，
 	// 所以把它们写进 index.html 的 import map，交给浏览器完成解析。
 	// 启动时读取一次，之后只读；改 tsconfig 需要重启 dev server。
@@ -77,6 +81,16 @@ func (d *DevServer) fail(w http.ResponseWriter, path, body string) {
 	http.Error(w, body, http.StatusInternalServerError)
 }
 
+// readTSConfigRaw 读取项目根目录的 tsconfig / jsconfig 原文，供 esbuild Transform 使用。
+func readTSConfigRaw(root string) string {
+	for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
+		if b, err := os.ReadFile(filepath.Join(root, name)); err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
 func NewDevServer(root string) (*DevServer, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -115,14 +129,15 @@ func NewDevServer(root string) (*DevServer, error) {
 	}
 
 	d := &DevServer{
-		root:       abs,
-		entry:      detectDevEntry(abs),
-		watcher:    w,
-		clients:    map[*websocket.Conn]bool{},
-		depsCache:  map[string][]byte{},
-		rootDeps:   rootDeps,
-		modulesDir: modulesDir,
-		aliases:    compiler.LoadAliases(abs),
+		root:        abs,
+		entry:       detectDevEntry(abs),
+		watcher:     w,
+		clients:     map[*websocket.Conn]bool{},
+		depsCache:   map[string][]byte{},
+		rootDeps:    rootDeps,
+		modulesDir:  modulesDir,
+		aliases:     compiler.LoadAliases(abs),
+		tsconfigRaw: readTSConfigRaw(abs),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -344,7 +359,9 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := res.OutputFiles[0].Contents
+	// CJS 包（react 这类）esbuild 只能给出 default 导出，这里补上具名导出，
+	// 否则浏览器里的 `import { useState } from "react"` 会直接报错。
+	code := addCJSInterop(res.OutputFiles[0].Contents)
 	d.depsLock.Lock()
 	d.depsCache[raw] = code
 	d.depsLock.Unlock()
@@ -456,10 +473,11 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 			loader = api.LoaderJS
 		}
 		res := api.Transform(string(src), api.TransformOptions{
-			Loader:     loader,
-			Format:     api.FormatESModule,
-			Sourcefile: rel,
-			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
+			Loader:      loader,
+			Format:      api.FormatESModule,
+			Sourcefile:  rel,
+			TsconfigRaw: d.tsconfigRaw,
+			Define:      map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(res.Errors) > 0 {
 			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
@@ -493,10 +511,11 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 		// 与构建期一致：lang="ts" 的产物要再过一遍 TS 转译，否则浏览器会在
 		// `interface` / `ref<number>()` 处直接语法报错。
 		tr := api.Transform(res.Code, api.TransformOptions{
-			Loader:     compiler.SFCLoader(res.Lang),
-			Format:     api.FormatESModule,
-			Sourcefile: rel,
-			Define:     map[string]string{"process.env.NODE_ENV": "\"development\""},
+			Loader:      compiler.SFCLoader(res.Lang),
+			Format:      api.FormatESModule,
+			Sourcefile:  rel,
+			TsconfigRaw: d.tsconfigRaw,
+			Define:      map[string]string{"process.env.NODE_ENV": "\"development\""},
 		})
 		if len(tr.Errors) > 0 {
 			d.fail(w, srcURL, "vue ts transform error:\n"+compiler.FormatMessages(tr.Errors))

@@ -11,6 +11,18 @@ import (
 	"github.com/evanw/esbuild/pkg/api"
 )
 
+// tsconfigRaw 读取项目根目录的 tsconfig.json 原文，交给 esbuild 作为全局覆盖。
+// esbuild 只会为「自己解析到的文件」查找 tsconfig；插件（如别名插件）解析出的
+// 文件拿不到 tsconfig，`jsx: react-jsx` 之类的设置会丢失。这里显式传原文。
+func tsconfigRaw(rootDir string) string {
+	for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
+		if b, err := os.ReadFile(filepath.Join(rootDir, name)); err == nil {
+			return string(b)
+		}
+	}
+	return ""
+}
+
 // DetectServerEntry 在 webDir 下按约定探测 SSR 入口，返回相对路径（找不到返回 ""）。
 // 覆盖 entry-server.tsx/.ts/.jsx/.js 以及 Vue 常用的 entry-server.vue.tsx 写法。
 func DetectServerEntry(webDir string) string {
@@ -70,6 +82,7 @@ func BuildSSRWith(rootDir, entry, modulesDir string) ([]byte, error) {
 		Platform:      api.PlatformBrowser,
 		EntryPoints:   []string{entry},
 		AbsWorkingDir: abs,
+		TsconfigRaw:   tsconfigRaw(abs),
 		NodePaths:     modulesNodePaths(rootDir, modulesDir),
 		Plugins:       buildPlugins(rootDir, modulesDir),
 		Define:        map[string]string{"process.env.NODE_ENV": "\"production\""},
@@ -107,6 +120,7 @@ func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error)
 		EntryPoints:       []string{entry},
 		AbsWorkingDir:     abs,
 		Outfile:           outfile,
+		TsconfigRaw:       tsconfigRaw(abs),
 		NodePaths:         modulesNodePaths(rootDir, modulesDir),
 		Plugins:           buildPlugins(rootDir, modulesDir),
 		Define:            map[string]string{"process.env.NODE_ENV": "\"production\""},
@@ -156,6 +170,7 @@ func BuildClientSplit(rootDir, entry, outDir, modulesDir string) ([]api.OutputFi
 		Platform:      api.PlatformBrowser,
 		AbsWorkingDir: abs,
 		Outdir:        outDir,
+		TsconfigRaw:   tsconfigRaw(abs),
 		// 入口产物固定叫 client.js（esbuild 默认用入口文件名，这里统一改名，
 		// 好处是 SSR 注入的 <script src="/assets/client.js"> 不用跟着变）。
 		EntryPoints:       []string{entry, "wf:vendor"}, // 第二个入口只为把共享依赖逼成独立 chunk
@@ -240,12 +255,13 @@ func clientUsedPackages(abs, entry, modulesDir string) []string {
 		AbsWorkingDir: abs,
 		// 入口若 import 了 CSS，一次构建会有 JS+CSS 两个输出，esbuild 要求显式
 		// outdir/outfile 才肯出多文件（Write:false 不落盘，这里只是占位）。
-		Outdir:    "wf-probe",
-		NodePaths: modulesNodePaths(abs, modulesDir),
-		Plugins:   buildPlugins(abs, modulesDir),
-		Define:    map[string]string{"process.env.NODE_ENV": "\"production\""},
-		Metafile:  true,
-		LogLevel:  api.LogLevelSilent,
+		Outdir:      "wf-probe",
+		TsconfigRaw: tsconfigRaw(abs),
+		NodePaths:   modulesNodePaths(abs, modulesDir),
+		Plugins:     buildPlugins(abs, modulesDir),
+		Define:      map[string]string{"process.env.NODE_ENV": "\"production\""},
+		Metafile:    true,
+		LogLevel:    api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
 		return nil // 探路失败就退化成"不拆 vendor"
