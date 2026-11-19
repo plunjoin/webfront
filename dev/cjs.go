@@ -27,6 +27,7 @@ package dev
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -61,6 +62,68 @@ var jsReservedWords = map[string]bool{
 	"super": true, "switch": true, "this": true, "throw": true, "true": true,
 	"try": true, "typeof": true, "var": true, "void": true, "while": true,
 	"with": true, "yield": true,
+}
+
+// cjsExternalRequire 匹配 esbuild 为"CJS 代码 require 外置包"生成的动态调用。
+var cjsExternalRequire = regexp.MustCompile(`__require\((?:"([^"]+)"|'([^']+)')\)`)
+
+// rewriteExternalRequires 把 `__require("react")` 改成顶层静态导入。
+//
+// CJS 依赖（react-dom 是典型）用 require() 取同级包。若 esbuild 把该包标记为
+// external，产物会留下 `var React = __require("react")` —— __require 在浏览器
+// ESM 里是动态 require，运行即 "Dynamic require of react is not supported"，
+// 等于外置不可用。这里为每个外置 specifier 生成
+//
+//	import * as __wf_ext_ns_0 from "react";
+//	const __wf_ext_0 = __wf_ext_ns_0.default !== undefined ? __wf_ext_ns_0.default : __wf_ext_ns_0;
+//
+// 并把调用点换成该绑定：`/@deps/react.js` 对 CJS 入口提供 default（= module.exports）
+// 与具名导出，语义与 require() 一致；纯 ESM 包没有 default 时退回命名空间。
+// 外置后仍由 import map 复用同一份实例。
+// ESM 依赖间本来就是静态 import，不会被这个正则碰到。
+func rewriteExternalRequires(code []byte, externals map[string]bool) []byte {
+	s := string(code)
+	matches := cjsExternalRequire.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return code
+	}
+	var (
+		header   strings.Builder
+		out      strings.Builder
+		bindings = map[string]string{}
+		last     int
+	)
+	for _, m := range matches {
+		// 两个分支只有一个命中：双引号 spec 在 [2:3]，单引号在 [4:5]。
+		var spec string
+		if m[2] >= 0 {
+			spec = s[m[2]:m[3]]
+		} else {
+			spec = s[m[4]:m[5]]
+		}
+		if !externals[packageOf(spec)] {
+			continue
+		}
+		binding, ok := bindings[spec]
+		if !ok {
+			n := strconv.Itoa(len(bindings))
+			ns := "__wf_ext_ns_" + n
+			binding = "__wf_ext_" + n
+			bindings[spec] = binding
+			header.WriteString("import * as " + ns + " from " + strconv.Quote(spec) + ";\n")
+			// CJS 包（react 这类）的 /@deps 产物 default 就是 module.exports；
+			// 纯 ESM 包没有 default，退回命名空间。语义对齐 require()。
+			header.WriteString("const " + binding + " = " + ns + ".default !== undefined ? " + ns + ".default : " + ns + ";\n")
+		}
+		out.WriteString(s[last:m[0]])
+		out.WriteString(binding)
+		last = m[1]
+	}
+	if len(bindings) == 0 {
+		return code
+	}
+	out.WriteString(s[last:])
+	return []byte(header.String() + out.String())
 }
 
 // addCJSInterop 给 CJS 入口的 ESM 产物补上具名导出；不是 CJS 入口时原样返回。

@@ -231,7 +231,7 @@ func virtualVendorPlugin(resolveDir string, pkgs []string) api.Plugin {
 // filterRootDeps 只保留 store manifest 里登记为根依赖的包；无 store 时原样返回。
 func filterRootDeps(abs, modulesDir string, pkgs []string) []string {
 	storeDir := filepath.Join(resolveModulesDir(abs, modulesDir), ".store")
-	m, err := LoadStoreManifest(storeDir)
+	m, err := LoadProjectStoreManifest(storeDir, abs)
 	if err != nil || len(m.Root) == 0 {
 		return pkgs
 	}

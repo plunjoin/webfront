@@ -15,10 +15,12 @@ import (
 //     "Failed to fetch dynamically imported module"；
 //  3. Go 进程重启（wf dev 重新编译）期间轮询 /__wf_ping，回来后整页重载。
 //
-// __WF_ENTRY__ 会被替换成带引号的入口路径；用 ReplaceAll 而不是 Sprintf，
-// 免得将来往 JS 里写个 % 就炸。
+// __WF_ENTRY__ / __WF_BASE__ 会被替换成带引号的入口路径与挂载前缀；
+// 用 ReplaceAll 而不是 Sprintf，免得将来往 JS 里写个 % 就炸。
+// 入口本身已带前缀，BASE 只用于 HMR / 探活 / 错误端点。
 const hmrJS = `
 var ENTRY = __WF_ENTRY__;
+var BASE = __WF_BASE__;
 
 var ov = window.__wfOverlay || {
   show: function () {},
@@ -48,7 +50,7 @@ async function explain(path, err) {
   } catch (_) {}
   if (!detail) {
     try {
-      var er = await fetch('/__wf_error?since=' + errSeq, { cache: 'no-store' });
+      var er = await fetch(BASE + '/__wf_error?since=' + errSeq, { cache: 'no-store' });
       if (er.ok) {
         var j = await er.json();
         if (j && j.body) {
@@ -70,7 +72,7 @@ async function report(path, err) {
 
 function connect() {
   var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  var ws = new WebSocket(proto + location.host + '/__wf_hmr');
+  var ws = new WebSocket(proto + location.host + BASE + '/__wf_hmr');
 
   ws.onopen = function () {
     connected = true;
@@ -120,7 +122,7 @@ function connect() {
     (async function () {
       for (;;) {
         try {
-          await fetch('/__wf_ping?t=' + Date.now(), { cache: 'no-store' });
+          await fetch(BASE + '/__wf_ping?t=' + Date.now(), { cache: 'no-store' });
           break;
         } catch (_) {
           await new Promise(function (r) { setTimeout(r, 300); });
@@ -143,7 +145,9 @@ import(ENTRY + '?t=' + Date.now()).then(function (m) {
 `
 
 // clientScript 返回注入 index.html 的完整内联脚本内容（覆盖层 + HMR）。
-func clientScript(entry string) string {
+// entry 已带挂载前缀；base 用于 HMR / 探活 / 错误端点。
+func clientScript(entry, base string) string {
 	js := strings.ReplaceAll(hmrJS, "__WF_ENTRY__", strconv.Quote(entry))
+	js = strings.ReplaceAll(js, "__WF_BASE__", strconv.Quote(base))
 	return devui.ClientScript() + js
 }

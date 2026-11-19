@@ -5,12 +5,16 @@ package compiler
 //
 // 目录布局：
 //   <storeDir>/<name>@<version>/...        （scoped 包名里的 "/" 换成 "+"）
-//   <storeDir>/manifest.json               （root 依赖 + 每个包的依赖版本表）
+//   <storeDir>/manifests/<key>.json        （每个工程自己的 root 依赖表）
+//   <storeDir>/manifest.json               （所有工程合并版，兼容旧读取方）
 //
 // 解析规则：看"发起 import 的文件属于哪个包"，再查该包在 manifest 里声明的版本。
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +36,7 @@ func StoreDirName(name, version string) string {
 	return strings.ReplaceAll(name, "/", "+") + "@" + version
 }
 
-// LoadStoreManifest 读取 <storeDir>/manifest.json。
+// LoadStoreManifest 读取 <storeDir>/manifest.json（所有项目合并后的版本）。
 func LoadStoreManifest(storeDir string) (StoreManifest, error) {
 	b, err := os.ReadFile(filepath.Join(storeDir, "manifest.json"))
 	if err != nil {
@@ -43,6 +47,113 @@ func LoadStoreManifest(storeDir string) (StoreManifest, error) {
 		return StoreManifest{}, err
 	}
 	return m, nil
+}
+
+// ProjectManifestKey 生成项目在共享 store 里的 manifest 文件名。
+//
+// 用"目录名 + 绝对路径哈希"而不是纯目录名：两个不同仓库里的 admin/ 不能撞车，
+// 同一项目换工作目录也不会变（绝对路径变了会变，重新 install 一次即可）。
+func ProjectManifestKey(projectDir string) string {
+	abs, err := filepath.Abs(projectDir)
+	if err != nil {
+		abs = projectDir
+	}
+	abs = filepath.Clean(abs)
+	sum := sha256.Sum256([]byte(filepath.ToSlash(abs)))
+	base := sanitizeKey(filepath.Base(abs))
+	if base == "" || base == "." {
+		base = "project"
+	}
+	return base + "-" + hex.EncodeToString(sum[:4])
+}
+
+func sanitizeKey(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+func projectManifestPath(storeDir, projectDir string) string {
+	return filepath.Join(storeDir, "manifests", ProjectManifestKey(projectDir)+".json")
+}
+
+// LoadProjectStoreManifest 优先读本项目的 manifest（共享 store 场景下每个工程
+// 各有一份），不存在时回退到合并版 manifest.json，兼容旧布局与手写测试数据。
+func LoadProjectStoreManifest(storeDir, projectDir string) (StoreManifest, error) {
+	if b, err := os.ReadFile(projectManifestPath(storeDir, projectDir)); err == nil {
+		var m StoreManifest
+		if json.Unmarshal(b, &m) == nil {
+			return m, nil
+		}
+	}
+	return LoadStoreManifest(storeDir)
+}
+
+// SaveProjectStoreManifest 写本项目专属 manifest，并把 store 里所有项目的
+// manifest 合并回 manifest.json。
+//
+// 共享 store 时，先后 install 两个工程不会再互相覆盖：各自读
+// manifests/<key>.json；合并版只是给旧版读取方（以及人工排查）看的并集。
+// 同一依赖出现不同版本时保留先读到的版本并给出提示。
+func SaveProjectStoreManifest(storeDir, projectDir string, m StoreManifest) error {
+	dir := filepath.Join(storeDir, "manifests")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	mb, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(projectManifestPath(storeDir, projectDir), append(mb, '\n'), 0o644); err != nil {
+		return err
+	}
+
+	merged := StoreManifest{Root: map[string]string{}, Packages: map[string]map[string]string{}}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var pm StoreManifest
+		if json.Unmarshal(b, &pm) != nil {
+			continue
+		}
+		for k, v := range pm.Root {
+			if old, ok := merged.Root[k]; ok && old != v {
+				fmt.Printf("⚠️ 共享 store: %s 版本冲突（%s / %s），本项目以 manifests/%s 为准\n",
+					k, old, v, ProjectManifestKey(projectDir)+".json")
+				continue
+			}
+			merged.Root[k] = v
+		}
+		for pkg, deps := range pm.Packages {
+			if merged.Packages[pkg] == nil {
+				merged.Packages[pkg] = map[string]string{}
+			}
+			for k, v := range deps {
+				merged.Packages[pkg][k] = v
+			}
+		}
+	}
+	out, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(storeDir, "manifest.json"), append(out, '\n'), 0o644)
 }
 
 // resolveModulesDir 统一解析依赖目录路径（支持相对 rootDir 路径或绝对路径）。
@@ -61,7 +172,7 @@ func resolveModulesDir(rootDir, modulesDir string) string {
 // store 不存在或未声明该依赖时返回 ""，调用方应回退平铺路径。
 func StorePackageDir(rootDir, modulesDir, pkgName string) string {
 	storeDir := filepath.Join(resolveModulesDir(rootDir, modulesDir), ".store")
-	m, err := LoadStoreManifest(storeDir)
+	m, err := LoadProjectStoreManifest(storeDir, rootDir)
 	if err != nil {
 		return ""
 	}
@@ -84,7 +195,7 @@ func StorePlugins(rootDir, modulesDir string) []api.Plugin {
 // storePlugins 若 <rootDir>/<modulesDir>/.store/manifest.json 存在，返回 store 解析插件。
 func storePlugins(rootDir, modulesDir string) []api.Plugin {
 	storeDir := filepath.Join(resolveModulesDir(rootDir, modulesDir), ".store")
-	m, err := LoadStoreManifest(storeDir)
+	m, err := LoadProjectStoreManifest(storeDir, rootDir)
 	if err != nil {
 		return nil
 	}

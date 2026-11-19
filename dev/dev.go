@@ -35,6 +35,19 @@ type DevServer struct {
 	rootDeps   map[string]string
 	modulesDir string
 
+	// 挂载前缀（"" 表示根路径）：生成的 URL、import map、HMR 地址都带上它。
+	basePath string
+
+	// esbuild define 表：默认 NODE_ENV=development，Vue 项目自动补特性开关，
+	// 用户通过 WithDefine 追加的项最后覆盖。
+	define     map[string]string
+	userDefine map[string]string
+
+	// /@deps 打包时外置的包。默认是所有 root 依赖（同一 runtime 只加载一份）；
+	// externalSet 记录调用方是否显式设置过（WithExternal() 空列表 = 关闭）。
+	externals   map[string]bool
+	externalSet bool
+
 	// tsconfig.json 原文：esbuild 的 Transform 不会自动找 tsconfig，
 	// 不传的话 `jsx: react-jsx` 会退化成 React.createElement。
 	tsconfigRaw string
@@ -91,29 +104,48 @@ func readTSConfigRaw(root string) string {
 	return ""
 }
 
-func NewDevServer(root string) (*DevServer, error) {
+func NewDevServer(root string, opts ...Option) (*DevServer, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 	abs, _ := filepath.Abs(root)
 
-	rootDeps := map[string]string{}
-	modulesDir := "node_modules"
+	d := &DevServer{
+		root:      abs,
+		watcher:   w,
+		clients:   map[*websocket.Conn]bool{},
+		depsCache: map[string][]byte{},
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+	}
+	for _, opt := range opts {
+		opt(d)
+	}
 
-	// 1. 优先从版本化 store 的 manifest.json 中读取 root 依赖
-	for _, md := range []string{"wf_modules", "node_modules"} {
-		sd := filepath.Join(abs, md, ".store")
-		if m, err := compiler.LoadStoreManifest(sd); err == nil {
+	// 依赖目录与 root 依赖：显式 WithModulesDir 优先，否则自底向上探测。
+	// rootDeps 同时用于 import map 与 /@deps 的默认外置集合。
+	modulesDir := d.modulesDir
+	if modulesDir == "" {
+		if md, ok := findModulesDir(abs); ok {
 			modulesDir = md
-			for k, v := range m.Root {
-				rootDeps[k] = v
-			}
-			break
+		} else {
+			modulesDir = "node_modules"
+		}
+	}
+	rootDeps := map[string]string{}
+	storeDir := modulesDir
+	if !filepath.IsAbs(storeDir) {
+		storeDir = filepath.Join(abs, storeDir)
+	}
+	if m, err := compiler.LoadProjectStoreManifest(filepath.Join(storeDir, ".store"), abs); err == nil {
+		for k, v := range m.Root {
+			rootDeps[k] = v
 		}
 	}
 
-	// 2. 补充读取 package.json dependencies
+	// 补充读取 package.json dependencies
 	if b, err := os.ReadFile(filepath.Join(abs, "package.json")); err == nil {
 		var pj struct {
 			Dependencies    map[string]string `json:"dependencies"`
@@ -128,20 +160,20 @@ func NewDevServer(root string) (*DevServer, error) {
 		}
 	}
 
-	d := &DevServer{
-		root:        abs,
-		entry:       detectDevEntry(abs),
-		watcher:     w,
-		clients:     map[*websocket.Conn]bool{},
-		depsCache:   map[string][]byte{},
-		rootDeps:    rootDeps,
-		modulesDir:  modulesDir,
-		aliases:     compiler.LoadAliases(abs),
-		tsconfigRaw: readTSConfigRaw(abs),
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
+	d.modulesDir = modulesDir
+	d.rootDeps = rootDeps
+	d.define = buildDefine(rootDeps, d.userDefine)
+	if !d.externalSet {
+		// 默认把所有 root 依赖外置：经由 import map 共享同一份 /@deps/<pkg>.js，
+		// react-dom 内联一份 react 造成的 Invalid hook call 就此消失。
+		d.externals = map[string]bool{}
+		for pkg := range rootDeps {
+			d.externals[pkg] = true
+		}
 	}
+	d.entry = detectDevEntry(abs)
+	d.aliases = compiler.LoadAliases(abs)
+	d.tsconfigRaw = readTSConfigRaw(abs)
 	for _, a := range d.aliases {
 		if _, _, ok := d.aliasImport(a); !ok {
 			fmt.Printf("[alias] 跳过 %s（目标不在项目目录内，dev 无法提供）: %s\n", a.Prefix, a.Target)
@@ -242,6 +274,9 @@ func (d *DevServer) broadcast(msg any) {
 }
 
 // Handler 返回可挂载的 http.Handler（框架无关；Gin 用 gin.WrapH 即可）。
+//
+// 配了 WithBasePath("/admin") 时，既可以直接 mux.Handle("/admin/", ds.Handler())，
+// 也可以 http.StripPrefix("/admin", ds.Handler())——两种挂法都认。
 func (d *DevServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.serveIndex)
@@ -260,7 +295,26 @@ func (d *DevServer) Handler() http.Handler {
 	// 最近一次编译错误：嵌套 import 失败时，浏览器只能拿到一句
 	// "Failed to fetch dynamically imported module"，靠它换回真正的错误原文。
 	mux.HandleFunc("/__wf_error", d.serveLastError)
-	return mux
+	if d.basePath == "" {
+		return mux
+	}
+	// 内部路由保持不带前缀：外层 mux 不会自动剥前缀，所以这里统一处理。
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case p == d.basePath:
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = "/"
+			mux.ServeHTTP(w, r2)
+		case strings.HasPrefix(p, d.basePath+"/"):
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = strings.TrimPrefix(p, d.basePath)
+			mux.ServeHTTP(w, r2)
+		default:
+			// 调用方已经 StripPrefix 过：路径本来就是内部形态，直接交给 mux。
+			mux.ServeHTTP(w, r)
+		}
+	})
 }
 
 func (d *DevServer) serveLastError(w http.ResponseWriter, r *http.Request) {
@@ -285,8 +339,17 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 	imports := importMap["imports"].(map[string]string)
 	d.mu.Lock()
 	for pkg := range d.rootDeps {
-		imports[pkg] = "/@deps/" + pkg + ".js"
-		imports[pkg+"/"] = "/@deps/" + pkg + "/"
+		imports[pkg] = d.url("/@deps/" + pkg + ".js")
+		imports[pkg+"/"] = d.url("/@deps/" + pkg + "/")
+	}
+	// 显式 WithExternal 指定的包即使不在 rootDeps 里也要有映射，
+	// 否则浏览器无法解析外置后的裸导入。
+	for pkg := range d.externals {
+		if _, ok := imports[pkg]; ok {
+			continue
+		}
+		imports[pkg] = d.url("/@deps/" + pkg + ".js")
+		imports[pkg+"/"] = d.url("/@deps/" + pkg + "/")
 	}
 	d.mu.Unlock()
 
@@ -307,7 +370,7 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 	html := "<!doctype html><html><head><meta charset=\"utf-8\"><title>webfront dev (HMR)</title>" +
 		importMapTag +
 		"</head>\n<body>\n<div id=\"root\"></div>\n<script>\n" +
-		clientScript(d.entry) +
+		clientScript(d.url(d.entry), d.basePath) +
 		"</script>\n</body></html>"
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -342,7 +405,24 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	plugins := compiler.StorePlugins(d.root, d.modulesDir)
+	plugins := d.depPlugins(packageOf(pkgSpec))
+
+	// CSS 子路径（如 nprogress/nprogress.css）：esbuild 的 CSS 产物不是 JS，
+	// 浏览器不能直接 import。这里把它包成"导入即注入 <style>"的 ESM 模块。
+	if strings.HasSuffix(pkgSpec, ".css") {
+		code, errMsg := d.bundleDepCSS(pkgSpec, plugins)
+		if errMsg != "" {
+			d.fail(w, "/@deps/"+raw, errMsg)
+			return
+		}
+		d.depsLock.Lock()
+		d.depsCache[raw] = code
+		d.depsLock.Unlock()
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write(code)
+		return
+	}
+
 	opts := api.BuildOptions{
 		EntryPoints:   []string{pkgSpec},
 		Bundle:        true,
@@ -350,7 +430,8 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 		Platform:      api.PlatformBrowser,
 		AbsWorkingDir: d.root,
 		Plugins:       plugins,
-		Define:        map[string]string{"process.env.NODE_ENV": "\"development\""},
+		NodePaths:     d.nodePaths(),
+		Define:        d.define,
 		Write:         false,
 	}
 	res := api.Build(opts)
@@ -359,15 +440,77 @@ func (d *DevServer) serveDeps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// CJS 包（react 这类）esbuild 只能给出 default 导出，这里补上具名导出，
-	// 否则浏览器里的 `import { useState } from "react"` 会直接报错。
-	code := addCJSInterop(res.OutputFiles[0].Contents)
+	// CJS 对 CJS 的 require：esbuild 外置后留下的是浏览器跑不了的 __require()，
+	// 先换成静态 import；再补入口的具名导出（`import { useState } from "react"`）。
+	code := rewriteExternalRequires(res.OutputFiles[0].Contents, d.externals)
+	code = addCJSInterop(code)
 	d.depsLock.Lock()
 	d.depsCache[raw] = code
 	d.depsLock.Unlock()
 
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Write(code)
+}
+
+// depPlugins：外置插件必须排在 store 解析之前，否则 store 会先把裸导入
+// 解析成文件，外置就轮不到了。
+func (d *DevServer) depPlugins(entryPkg string) []api.Plugin {
+	var plugins []api.Plugin
+	if len(d.externals) > 0 {
+		plugins = append(plugins, externalPlugin(d.externals, entryPkg))
+	}
+	return append(plugins, compiler.StorePlugins(d.root, d.modulesDir)...)
+}
+
+// nodePaths：依赖目录不叫 node_modules 且没有 store manifest 时，
+// 仍要让 esbuild 能按 NODE_PATH 语义找到包。
+func (d *DevServer) nodePaths() []string {
+	if d.modulesDir == "" || d.modulesDir == "node_modules" {
+		return nil
+	}
+	p := d.modulesDir
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(d.root, p)
+	}
+	return []string{p}
+}
+
+// bundleDepCSS 打包依赖里的 CSS 子路径，返回注入样式的 ESM 模块。
+// 返回值第二项非空即为错误文本（交给覆盖层展示）。
+func (d *DevServer) bundleDepCSS(pkgSpec string, plugins []api.Plugin) ([]byte, string) {
+	res := api.Build(api.BuildOptions{
+		EntryPoints:   []string{pkgSpec},
+		Bundle:        true,
+		Write:         false,
+		Platform:      api.PlatformBrowser,
+		AbsWorkingDir: d.root,
+		Plugins:       plugins,
+		NodePaths:     d.nodePaths(),
+		Loader:        map[string]api.Loader{".css": api.LoaderCSS},
+		Outdir:        "wf-dev-css",
+		AssetNames:    "[name]-[hash]",
+		Define:        d.define,
+	})
+	if len(res.Errors) > 0 {
+		return nil, "bundle dep css " + pkgSpec + " error:\n" + compiler.FormatMessages(res.Errors)
+	}
+	var css strings.Builder
+	for _, f := range res.OutputFiles {
+		if strings.HasSuffix(f.Path, ".css") {
+			css.Write(f.Contents)
+		}
+	}
+	if css.Len() == 0 {
+		return nil, "bundle dep css " + pkgSpec + ": no css output（检查包的 exports / 文件是否存在）"
+	}
+	return cssModuleJS(css.String()), ""
+}
+
+// cssModuleJS 把 CSS 文本包成浏览器可 import 的模块：执行即注入 <style>。
+func cssModuleJS(css string) []byte {
+	cssJSON, _ := json.Marshal(css)
+	return []byte("const s=document.createElement('style');s.textContent=" + string(cssJSON) +
+		";document.head.appendChild(s);export default s.textContent;")
 }
 
 // aliasImport 把一个别名转成 import map 条目。
@@ -392,19 +535,20 @@ func (d *DevServer) aliasImport(a compiler.Alias) (key, url string, ok bool) {
 
 // devURL 把项目内的绝对路径映射成 dev server 的 URL：
 // src/ 下走 /src/（与入口一致），其余走 /@fs/（项目根相对）。
+// 配了 basePath 时 URL 也带上挂载前缀（HMR 广播的 path 必须能直接 import）。
 func (d *DevServer) devURL(p string) (string, bool) {
 	abs := filepath.Clean(p)
 	if rel, ok := relWithin(filepath.Join(d.root, "src"), abs); ok {
 		if rel == "." {
-			return "/src/", true
+			return d.url("/src/"), true
 		}
-		return "/src/" + filepath.ToSlash(rel), true
+		return d.url("/src/" + filepath.ToSlash(rel)), true
 	}
 	if rel, ok := relWithin(d.root, abs); ok {
 		if rel == "." {
-			return "/@fs/", true
+			return d.url("/@fs/"), true
 		}
-		return "/@fs/" + filepath.ToSlash(rel), true
+		return d.url("/@fs/" + filepath.ToSlash(rel)), true
 	}
 	return "", false
 }
@@ -477,7 +621,7 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 			Format:      api.FormatESModule,
 			Sourcefile:  rel,
 			TsconfigRaw: d.tsconfigRaw,
-			Define:      map[string]string{"process.env.NODE_ENV": "\"development\""},
+			Define:      d.define,
 		})
 		if len(res.Errors) > 0 {
 			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
@@ -495,11 +639,8 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 			d.fail(w, srcURL, compiler.FormatMessages(res.Errors))
 			return
 		}
-		cssJSON, _ := json.Marshal(string(res.Code))
-		js := "const s=document.createElement('style');s.textContent=" + string(cssJSON) +
-			";document.head.appendChild(s);export default s.textContent;"
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		w.Write([]byte(js))
+		w.Write(cssModuleJS(string(res.Code)))
 	case ".vue":
 		res, err := compiler.CompileSFCResult(d.root, d.modulesDir, string(src), full)
 		if err != nil {
@@ -515,7 +656,7 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 			Format:      api.FormatESModule,
 			Sourcefile:  rel,
 			TsconfigRaw: d.tsconfigRaw,
-			Define:      map[string]string{"process.env.NODE_ENV": "\"development\""},
+			Define:      d.define,
 		})
 		if len(tr.Errors) > 0 {
 			d.fail(w, srcURL, "vue ts transform error:\n"+compiler.FormatMessages(tr.Errors))

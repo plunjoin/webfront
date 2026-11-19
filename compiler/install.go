@@ -6,8 +6,9 @@ package compiler
 // 全程零 Node、零 CGO。
 //
 // 唯一布局（版本化 store）：
-//   <modulesDir>/.store/<name>@<ver>/...   多版本共存，配合 StoreResolver
-//   <modulesDir>/.store/manifest.json      root 依赖 + 每个包的依赖版本表
+//   <modulesDir>/.store/<name>@<ver>/...          多版本共存，配合 StoreResolver
+//   <modulesDir>/.store/manifests/<key>.json      每个工程自己的 root 依赖表
+//   <modulesDir>/.store/manifest.json             所有工程合并版（兼容旧读取方）
 // 构建时自动挂载 StoreResolver 解析，无需任何额外配置。
 
 import (
@@ -180,8 +181,9 @@ func InstallStore(root, modulesDir string) error {
 			m.Packages[StoreDirName(name, p.Version)] = out
 		}
 	}
-	mb, _ := json.MarshalIndent(m, "", "  ")
-	if err := os.WriteFile(filepath.Join(storeDir, "manifest.json"), append(mb, '\n'), 0o644); err != nil {
+	// 每个工程各写一份 manifests/<key>.json，再合并出 manifest.json。
+	// 多个工程共用同一个 store 时，先后 install 不再互相覆盖 root 依赖表。
+	if err := SaveProjectStoreManifest(storeDir, root, m); err != nil {
 		return err
 	}
 	fmt.Printf("✅ wf install(store): %d 包入 store, %d 已存在, manifest 覆盖 %d 个包\n",
