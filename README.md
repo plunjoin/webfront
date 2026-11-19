@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.4（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入。
+> **文档对应 v0.1.5（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.4
+go get github.com/plunjoin/webfront@v0.1.5
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.4
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.5
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.4` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.4` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.5` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.5` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -444,8 +444,13 @@ func main() { os.Exit(cli.Run(os.Args[1:])) }
 ```
 web/wf_modules/.store/react@18.3.1/
 web/wf_modules/.store/@vue+runtime-dom@3.5.13/
-web/wf_modules/.store/manifest.json
+web/wf_modules/.store/manifests/<project-key>.json   # 每个工程自己的 root 依赖表
+web/wf_modules/.store/manifest.json                  # 所有工程合并版（兼容旧读取方）
 ```
+
+多个前端工程可以共用同一个 `wf_modules`（如 `portal/` 与 `admin/` 都指向 `../wf_modules`）：
+每个工程读自己的 `manifests/<project-key>.json`，先后 `wf install` 不会互相覆盖；
+构建与 dev 会优先读这份，找不到时才回退合并版 `manifest.json`。
 
 **不做版本解析**——`npm install` 生成 lockfile 那一步仍交给 npm/pnpm（实测纯 Go 从零解析会把 `scheduler ^0.23.2` 错解成 `0.28.0-canary`）。`wf install` 只负责"精确拉取 + 校验 + 解压"，替代 `npm install` 的下载角色。
 
@@ -473,6 +478,36 @@ Go 进程里的机器码换不掉，所以这里不是"热替换"，而是**重�
 > - **SSR / goja 渲染失败** —— 调用方普遍写 `_ = eng.Render(...)`，所以引擎自己把响应写成错误页（`Config.Dev` 或 `WF_DEV=1` 时），生产态只回干净的 500，不泄露内部栈。
 
 代价是重启窗口内（通常 2–3s）的请求会失败——这是进程级重启绕不开的；需要零中断就得自己做多进程热切，不在本项目的取舍范围内。
+
+### 应用内挂载：`dev.NewDevServer` 的选项
+
+`wf dev` 只是推荐入口；需要把 dev server 嵌进自己的路由时，`NewDevServer` 的可选项
+覆盖了子路径部署与常见框架配置：
+
+```go
+ds, err := dev.NewDevServer("./web",
+    dev.WithBasePath("/admin"),                    // 整体挂在 /admin 下
+    dev.WithModulesDir("../../wf_modules"),        // 共享 store（默认自动向上找 wf_modules）
+    dev.WithExternal("react", "react-dom"),        // /@deps 外置（默认所有 root 依赖）
+    dev.WithDefine(map[string]string{              // 追加 esbuild define
+        "__APP_VERSION__": `"1.2.3"`,
+    }),
+)
+if err != nil { log.Fatal(err) }
+mux.Handle("/admin/", ds.Handler())   // import map / HMR / 广播都会带 /admin 前缀
+```
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `WithBasePath(p)` | 无前缀 | 壳 HTML、import map、HMR WebSocket 与广播 path 全部带上 `p`；`mux.Handle(p+"/", ds.Handler())` 即可 |
+| `WithModulesDir(dir)` | 自动探测 | 依次看 `<root>/wf_modules`、`<root>/node_modules`，再逐级向上找共享 `wf_modules`；可传相对/绝对路径 |
+| `WithExternal(specs...)` | 所有 root 依赖 | 打包 `/@deps/<pkg>.js` 时把别的 root 依赖留成裸导入，由 import map 复用同一份模块（react-dom 不再内联 react）；传空参数关闭 |
+| `WithDefine(map)` | `NODE_ENV=development`（Vue 项目自动补 `__VUE_*__`） | 合并进 esbuild 的 define，自定义项优先 |
+
+`/@deps` 还支持 CSS 子路径：`import "nprogress/nprogress.css"` 会返回一个
+"导入即注入 `<style>`" 的 ESM 模块，不需要调用方自己处理样式文件。外置的 CJS 依赖
+（如 react-dom 内部 `require("react")`）会被改写成静态 `import`，不会留下浏览器
+跑不了的动态 `require`。
 
 ---
 
@@ -593,12 +628,18 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.4 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.5 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### v0.1.5 相对 v0.1.4
+
+- **共享 store 按工程隔离**：`wf install` 额外写 `.store/manifests/<project-key>.json`，多个前端工程共用 `wf_modules` 时互不覆盖；合并版 `manifest.json` 继续保留给旧读取方
+- **`dev.NewDevServer` 选项**：新增 `WithBasePath` / `WithModulesDir` / `WithExternal` / `WithDefine`，支持子路径挂载、共享依赖目录、runtime 单例与自定义 define
+- **`/@deps` 外置与 CSS 子路径**：默认把所有 root 依赖外置（react-dom 不再内联 react），CJS 的 `require()` 改写成静态 import；`nprogress/nprogress.css` 这类子路径直接返回注入样式的 ESM
 
 ### v0.1.4 相对 v0.1.3
 

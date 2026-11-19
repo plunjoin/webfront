@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.4 已实现并验证**（v0.1.3 已发布；v0.1.4 修复 tsconfig JSX 与 dev 下 CJS 具名导出）。最后更新：2026-11-17。
+> **状态：v0.1.5 已实现并验证**（v0.1.4 已发布；v0.1.5 新增共享 store 的工程级 manifest、`dev.NewDevServer` 选项与 `/@deps` 外置单例）。最后更新：2026-11-19。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.4 |
+| 维度 | 草案 v0 | 现状 v0.1.5 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **6 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cli` / `cmd/wf`） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -397,12 +397,21 @@ web/wf_modules/
 │   ├── react@18.3.1/
 │   ├── @vue+runtime-dom@3.5.13/      ← scoped 包的 "/" 换成 "+"
 │   ├── ...
-│   └── manifest.json
+│   ├── manifests/
+│   │   ├── portal-a1b2c3d4.json        ← 每个工程自己的 root 依赖表
+│   │   └── admin-e5f6a7b8.json
+│   └── manifest.json                   ← 所有工程合并版（兼容旧读取方）
 │       { "root":     { "react": "18.3.1", ... },
 │         "packages": { "@vue+compiler-core@3.5.13": { "@babel/parser": "7.29.11", ... } } }
 ```
 
 解析规则：看**发起 import 的文件属于哪个包**，再查该包在 manifest 里声明的版本。这样 `a→react@17` 与 `b→react@18` 可以在同一次构建里共存。
+
+**共享 store 的 manifest 隔离**：多个前端工程可以指向同一个 `../wf_modules`。
+`SaveProjectStoreManifest` 为每个工程写 `manifests/<目录名>-<绝对路径哈希>.json`，再把所有
+工程合并回 `manifest.json`；`LoadProjectStoreManifest` 优先读本项目那份，找不到才回退合并版。
+因此先后 `wf install` 不会再让前一个工程的 dev 解析失败；同一依赖出现不同版本时，
+每个工程读到的仍是自己声明的版本（合并版保留先读到的并打印冲突提示）。
 
 示例工程实测：29 个包目录，`react/react-dom/vue/@vue/server-renderer/@vue/compiler-sfc` 5 个根依赖。
 
@@ -664,6 +673,29 @@ esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 
 `module.exports = require_x()` 链扫描 `exports.foo` / `Object.defineProperty`，把能静态识别的
 名字补成 `export const`。这样 `import { useState } from "react"` 不需要改调用方；无法静态识别的
 导出保持 default-only，避免伪造绑定。
+
+**挂载前缀（`WithBasePath`）**：内部路由始终按无前缀注册，`Handler()` 在最外层统一剥离
+`/admin`；生成 URL 时（`devURL`、import map、HMR 客户端里的 `BASE`、广播的 `update.path`）
+统一走 `d.url()` 加前缀。因此 `mux.Handle("/admin/", ds.Handler())` 与
+`http.StripPrefix("/admin", ds.Handler())` 两种挂法都可用；调用方不再需要在外面流式改写 HTML。
+
+**依赖目录探测（`WithModulesDir`）**：显式参数优先；否则依次看 `<root>/wf_modules`、
+`<root>/node_modules` 里有没有 `.store/manifest.json`，再逐级向上找共享的 `<parent>/wf_modules`
+（向上只认 `wf_modules`，避免误用某个祖先目录里无关的 `node_modules`）。共享 store 的
+manifest 按工程分文件，见 §4.6。
+
+**`/@deps` 的单例与 CSS 子路径**：
+
+- 默认把所有 root 依赖列为 external：打包 `react-dom` 时 `import "react"` 原样留在产物里，
+  由 import map 路由到同一个 `/@deps/react.js`，不会内联出第二份 React（Invalid hook call）。
+  入口包自己的内部导入不外置，避免把同一个包拆成多份；`WithExternal()` 可关闭/覆盖。
+  CJS 依赖的 `require("react")` 走不了静态 import，esbuild 会留成浏览器无法执行的
+  `__require()`；`rewriteExternalRequires` 把它换成顶部 `import * as` + default/命名空间
+  选择（与 `require()` 语义对齐），外置才真正可用。
+- 以 `.css` 结尾的请求走单独的 CSS 打包路径：esbuild 产出 CSS（支持 `@import`），
+  再包成"导入即注入 `<style>`"的 ESM，`nprogress/nprogress.css` 这类子路径可直接 import。
+- define 表默认 `process.env.NODE_ENV="development"`；root 依赖含 `vue` / `@vue/*` 时自动补
+  `__VUE_OPTIONS_API__=true`、`__VUE_PROD_DEVTOOLS__=false` 等特性开关；`WithDefine` 追加项优先。
 
 ### 7.2 HMR 协议
 

@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.4）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.5）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -387,7 +387,8 @@ func PageFile(url string) string {
 - lockfile 必须有 `packages` 映射（npm v7+ 生成的格式）；没有 → `lockfile has no packages (run npm install first)`。
 - 读取每个包的 `resolved` + `integrity`，16 并发下载 `.tgz`，校验 sha512，解压到 `<webDir>/<modulesDir>/.store/<name>@<version>/`。
 - 已存在 `package.json` 的包会跳过（不重复下载）。
-- 最后**覆盖**写 `<modulesDir>/.store/manifest.json`，记录本次 lockfile 的包与根依赖；不做多 lockfile 合并。
+- 最后写 `.store/manifests/<project-key>.json`（`<目录名>-<绝对路径哈希前 8 位>.json`），记录本工程 lockfile 的包与根依赖；再把 `manifests/*.json` 合并写回 `.store/manifest.json`，供旧读取方与人工排查。
+- 多个工程共用同一个 store 时，先后 `wf install` 不再互相覆盖：读取优先本项目 manifest，不存在才回退合并版。合并版遇到同名 root 依赖不同版本时保留先读到的版本并打印冲突提示；各工程仍以自己那份为准。
 - 不做版本解析：`package.json` 里的 `^` / `~` 由 npm 生成 lockfile 时解析，`wf install` 只负责精确拉取。
 
 ## 9. CLI 契约
@@ -427,7 +428,26 @@ func PageFile(url string) string {
 - 子进程环境追加 `WF_DEV=1`。
 - 编译失败不杀旧进程；子进程 panic 退出后，改代码会重新拉起。
 
+### 9.5 `dev.NewDevServer` 的选项
+
+`NewDevServer(root string, opts ...dev.Option)` 默认行为不变（`NewDevServer("./web")`）；选项在依赖探测之前应用。
+
+| 选项 | 默认 | 契约 |
+| --- | --- | --- |
+| `WithBasePath(p)` | 无前缀 | 归一化为 `""` 或 `/admin`；壳 HTML、import map、HMR WebSocket、探活/错误端点与广播 path 全部带前缀。`Handler()` 同时接受带前缀与已 `StripPrefix` 的请求 |
+| `WithModulesDir(dir)` | 自动探测 | 显式目录（相对 root 或绝对路径）优先；默认依次看 `<root>/wf_modules`、`<root>/node_modules` 的 manifest 与可用目录，再逐级向上找 `<parent>/wf_modules`，都没有则 `node_modules` |
+| `WithExternal(specs...)` | 所有 root 依赖 | 按包名匹配（含子路径）；命中项在 `/@deps` 打包时保持裸导入，由 import map 复用同一份。传空参数关闭自动外置；入口包自身内部的导入不外置 |
+| `WithDefine(map)` | `process.env.NODE_ENV="development"`；Vue 依赖自动补 `__VUE_*__` | 合并进 dev 的所有 esbuild 构建/转译 define，调用方同名项优先 |
+
+外置 CJS 依赖里的 `require("react")` 会被改写成顶部静态 `import * as`，不留下浏览器无法执行的 `__require()`。`/@deps/<pkg>/<file>.css`（如 `nprogress/nprogress.css`）返回"导入即注入 `<style>`"的 ESM，而不是当 JS 入口打包。
+
 ## 10. 版本差异
+
+### v0.1.4 → v0.1.5：共享 store 与 dev 选项
+
+- `wf install` 增加 `.store/manifests/<project-key>.json`：每个工程一份 root 依赖表，多个工程共用 store 时互不覆盖；`manifest.json` 变成合并版，兼容旧读取方。
+- `dev.NewDevServer` 新增 `WithBasePath` / `WithModulesDir` / `WithExternal` / `WithDefine`；`Handler()` 支持直接挂载子路径，也兼容调用方自行 `StripPrefix`。
+- `/@deps` 默认外置所有 root 依赖，CJS 的 `require()` 改写成静态 import；新增 CSS 子路径的"导入即注入样式"模块。
 
 ### v0.1.3 → v0.1.4：tsconfig JSX 与 CJS 具名导出
 
