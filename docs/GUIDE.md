@@ -4,7 +4,7 @@
 > 每个方法写不写响应、返回什么状态码、缓存头是什么，见 [API 契约](API.md)。
 > 遇到报错直接跳到 [§10 排错](#10-排错按现象查)。
 
-> **本文对应 v0.1.5**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项。
+> **本文对应 v0.1.6**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项；v0.1.6 新增免 build tag 的 `dev.Handler` 与 `public/` 静态目录。
 
 ## 先看这个：React/Vue 当 Go 的模板引擎
 
@@ -115,6 +115,7 @@ your-app/
     ├── package.json        ← 依赖声明；wf install 只读 lockfile，dev server 会读它补依赖表
     ├── package-lock.json   ← wf install 唯一读取的文件
     ├── routes.json         ← 可选，预渲染路由
+    ├── public/             ← 静态资源：wf build 复制进 dist/，dev server 直接托管（-no-public 关闭）
     ├── dist/               ← wf build 产物（不进版本库，保留 .gitkeep）
     │   └── .gitkeep
     └── src/
@@ -674,60 +675,60 @@ mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 
 ### 6.1 应用里要有一段 dev server
 
-开发态由 `dev` 包提供进程内转译 + HMR。用 build tag 把它隔离在开发构建里：
+开发态由 `dev` 包提供进程内转译 + HMR。接线只需要一个 `dev.Handler` 调用，
+**不需要 build tag，也不再需要 `xxx_dev.go` + `xxx_prod.go` 两个文件**：
 
 ```go
-// dev_mode.go
-//go:build dev
-
-package main
-
-import (
-	"net/http"
-
-	"github.com/plunjoin/webfront/dev"
-)
-
-func runDev() {
-	ds, err := dev.NewDevServer("./web") // 指前端工程目录，不是 dist
-	if err != nil {
-		panic(err)
-	}
-	http.ListenAndServe(":8080", ds.Handler())
-}
+// main.go（唯一接线文件，无 build tag）
+mux := http.NewServeMux()
+mux.Handle("/admin/", dev.Handler("web/admin", webui.AdminHandler, dev.WithBasePath("/admin")))
+mux.Handle("/", dev.Handler("web/portal", func() http.Handler { return webui.PortalHandler(db) }))
 ```
 
-生产构建里没有 `runDev`，但 `main.go` 仍然引用了它，所以还需要一个 `!dev` 的桩文件：
+- **普通构建（不带 tag）**：`dev.Handler` 直接返回 `fallback()`，不碰磁盘、不启动监听；
+  `dev` 包只编译接线与选项，esbuild / fsnotify / websocket 都留在 `//go:build dev` 文件里。
+- **`-tags dev`**：在 root（前端工程目录，不是 dist）上启动 DevServer 并返回它的 handler，
+  fallback 不会执行。多个前端根各调用一次即可；选项与 `NewDevServer` 完全一致。
+- **fallback 必须是构造器**（`func() http.Handler`），不要传已经 new 好的 handler：
+  dev 构建里不会执行它，这样 `newEngine()` 不会因为 dist 还没构建而失败。
+
+需要自己控制监听时，`dev.NewDevServer` 仍然可用，但它只存在于 `-tags dev` 构建里。
+
+#### embed 与 `-tags dev`
+
+`-tags dev` 仍会编译 fallback 所在的包，所以 `//go:embed all:dist` 也会展开。
+推荐把 embed 声明拆成两个文件（都放在 web 包内）：
 
 ```go
-// dev_stub.go
+// webui/dist_embed.go
 //go:build !dev
 
-package main
+package webui
 
-import (
-	"fmt"
-	"os"
-)
+import "embed"
 
-func runDev() {
-	fmt.Println("这是生产构建（不含开发服务器）。开发模式请用：go tool wf dev")
-	os.Exit(1)
-}
+//go:embed all:dist
+var distFS embed.FS
 ```
 
 ```go
-// main.go
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "dev" {
-		runDev()
-		return
-	}
-	runProd()
-}
+// webui/dist_embed_dev.go
+//go:build dev
+
+package webui
+
+import "embed"
+
+// dev 构建由 DevServer 接管，不会读这个 FS；空声明只为让生产 handler 照常编译。
+var distFS embed.FS
 ```
 
-默认构建（不带 tag）不 import `dev`，所以 esbuild / fsnotify / websocket 不会进生产二进制。
+这样 `go build -tags dev` 不要求 `dist` 存在，生产 `go build` 仍照常要求产物。
+不想加桩文件也可以约定 dev 前先 `wf build` 一次，代价是全新克隆上的第一次
+`-tags dev` 构建会失败。
+
+默认构建虽然 import `dev`，但只编译 `Handler` 与选项；生产二进制里仍然没有
+esbuild / fsnotify / websocket。
 
 ### 6.2 `wf dev` 帮你做 Go 热重启
 
@@ -757,9 +758,9 @@ go build -tags dev .
 | `-watch` | `go.mod` 所在目录 | 监听范围 |
 | `-ldflags` | — | 透传 |
 
-`wf dev` 的 `rootDir` 是**应用目录**（`main.go` 所在目录），不是 `web/`。`web/src` 里的改动由应用内的 `dev.DevServer` 负责 HMR，不会触发 Go 重编译。
+`wf dev` 的 `rootDir` 是**应用目录**（`main.go` 所在目录），不是 `web/`。`web/src` 里的改动由应用内 `dev.Handler` 挂载的 DevServer 负责 HMR，不会触发 Go 重编译。
 
-> 两个 “dev” 不要混淆：`-tags dev` 是**编译标签**（决定 `dev_mode.go` 进不进二进制），`dev` 是**程序参数**（决定 `main` 走不走 `runDev`）。`wf dev` 两个都替你填好了。
+> 两个 “dev” 不要混淆：`-tags dev` 是**编译标签**（决定 DevServer 实现进不进二进制），`dev` 是 `wf dev` 默认传给应用的**程序参数**。用 `dev.Handler` 后应用可以忽略这个参数（示例工程就不再看 `os.Args`），`-run ""` 也不影响前端的 dev 接线。
 
 ### 6.3 开发态错误覆盖层
 
@@ -832,9 +833,10 @@ ENTRYPOINT ["/app"]
 | `go build .` + 预渲染 | 核心包 | ~6.9 MB |
 | `go build .` + SPA | 核心包 | ~6.9 MB |
 | `go build -tags dynamic .` | + jsruntime（goja） | ~15.6 MB |
-| `wf dev` / `-tags dev` | + dev（esbuild 等） | ~11.4 MB |
+| `wf dev` / `-tags dev` | + dev 的 `//go:build dev` 文件（esbuild / fsnotify / websocket） | ~11.4 MB |
 
-体积差异来自**有没有 import**，不是运行期开关。生产构建里不要 import `jsruntime`、`compiler`、`dev`。
+体积差异来自**有没有 import**，不是运行期开关。生产构建里不要 import `jsruntime`、`compiler`；
+`dev` 包本身可以安心 import——轻量文件只有 `Handler` 与选项，重依赖都带 `//go:build dev`。
 
 ---
 
@@ -845,14 +847,14 @@ ENTRYPOINT ["/app"]
 | `vite.config.ts` | **没有** | 构建参数走 CLI flags；运行期参数走 `webfront.Config` |
 | `resolve.alias` | **内置 `@/ → src/`，并读取 `tsconfig` paths** | 不需要 `vite.config`：默认 `@/foo` 指向 `<web>/src/foo`；`tsconfig.json` / `jsconfig.json` 的 `compilerOptions.paths`（含 `extends` / `references`）在 `wf build` 与 `wf dev` 都生效。`paths` 支持前缀通配（`"@ui/*"`）与精确键；目标必须在项目目录内，`wf dev` 通过 import map + `/@fs/` 提供 |
 | `define` / `import.meta.env` | 仅 `process.env.NODE_ENV` | 没有 `.env` 注入；运行期配置用 `Props` 或后端注入 |
-| `public/` | **没有自动拷贝** | 构建后把静态文件复制进 `dist/`（`embed` 会一起带上） |
+| `public/` | **构建复制 + dev 托管** | `wf build` 结束时把 `<web>/public/**` 原样复制进 `dist/`（`-no-public` 关闭；同名文件以 public 为准，`//go:embed` 会一起带上）。`dev.DevServer` 对未命中的路由回退到 `<root>/public/`，`dev.WithPublicDir` 可改目录或关闭 |
 | PostCSS / Tailwind | **没有内置管线** | 先用 Tailwind CLI / PostCSS 生成 `.css`，再当普通 CSS import |
 | 任意 Vite / Rollup 插件 | **不支持** | 内置的只有 Vue SFC 编译、store 解析、CSS 提取 |
 | `server.proxy` | **没有** | API 由同一个 Go 服务提供；前端用相对路径请求 |
 | `build.outDir` | `-out` / `Config.DistDir` | `-out` 相对当前工作目录 |
 | `build.assetsDir` | 固定 `assets/` | 产物布局见 [API 契约 §8](API.md) |
 | `base` | `-base` + `Config.BasePath` | 两边必须一致 |
-| HMR | `wf dev` + `dev.DevServer` | 不是 Vite 的 HMR 协议，体验类似 |
+| HMR | `wf dev` + `dev.Handler` 挂载的 DevServer | 不是 Vite 的 HMR 协议，体验类似 |
 | `entry-server` | `src/entry-server.*` 导出 `render` | 约定不同，见 §1.3 |
 | `import.meta.glob` | **没有这个 API** | 改成显式 import 列表 |
 | 动态 `import()` | 仅有限支持 | 表达式能被静态分析时（如模板字符串 glob）esbuild 会打包匹配文件；完全动态的表达式可能保留到运行期。不要依赖 Vite 的 glob 语义 |
@@ -940,6 +942,6 @@ SSR 不是“把 Go 的 session 塞进前端”——`Props` 必须是可 JSON �
 - [ ] 混合部署时，SPA 子路径挂在 `SPAHandler()` 上；SSR 失败不会被静默降级成 SPA
 - [ ] 需要自定义错误页时用 `RenderHTML`，没有在 `Render` 返回 err 后再写响应
 - [ ] `routes.json` 用的是 `path`，且 `dist/pages/` 里能看到对应文件
-- [ ] 生产构建没有 import `jsruntime` / `compiler` / `dev`（除非确实要动态 SSR）
+- [ ] 生产构建没有 import `jsruntime` / `compiler`（除非确实要动态 SSR）；`dev` 可以 import，重依赖都带 `//go:build dev`
 - [ ] 每个前端的依赖目录独立，或共享目录只由一个 lockfile 驱动
 - [ ] 发布构建清空了 `dist/`，没有残留旧路由 / 旧 chunk（`wf build` 会清理它自己的固定产物）

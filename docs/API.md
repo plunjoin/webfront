@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.5）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.6）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -415,6 +415,7 @@ func PageFile(url string) string {
 - `-modules auto`：优先选已有 `.store/manifest.json` 的 `wf_modules` / `node_modules`；否则选已存在的目录；都没有 → `wf_modules`。
 - `-prerender auto`：`<webDir>/routes.json` 存在 → 启用；`-` / `off` / `none` → 关闭；显式路径 → 原样使用。
 - 自动预渲染但没有 SSR bundle → 打印提示并跳过；显式 `-prerender` 但没有 SSR bundle → 报错退出 1。
+- `<webDir>/public` 存在 → 构建成功后把其中的普通文件按相对路径复制进产物目录；在所有构建产物之后复制，**同名文件以 public 为准**。`-no-public` 关闭。产物目录落在 `public/` 内时拒绝复制并退出 1（否则会递归）。
 
 ### 9.3 `wf build` 的依赖检查
 
@@ -427,10 +428,22 @@ func PageFile(url string) string {
 - 监听 `-watch`（默认 `go.mod` 所在目录），忽略 `node_modules` / `wf_modules` / `dist` / `vendor` / `.git` / `*_test.go`。
 - 子进程环境追加 `WF_DEV=1`。
 - 编译失败不杀旧进程；子进程 panic 退出后，改代码会重新拉起。
+- 实现位于 `dev/supervise`（`supervise.Run` / `supervise.Options`）：它依赖 fsnotify，只应被 CLI / tools 导入，不要放进线上服务。
 
-### 9.5 `dev.NewDevServer` 的选项
+### 9.5 `dev.Handler` 与 dev server 选项
 
-`NewDevServer(root string, opts ...dev.Option)` 默认行为不变（`NewDevServer("./web")`）；选项在依赖探测之前应用。
+应用侧统一接线（生产与 dev 用同一份代码，不需要 build tag）：
+
+```go
+admin := dev.Handler("web/admin", webui.AdminHandler, dev.WithBasePath("/admin"))
+portal := dev.Handler("web/portal", func() http.Handler { return webui.PortalHandler(db) })
+```
+
+- 无 tag 构建：直接返回 `fallback()`；`fallback` 为 nil 或返回 nil 时给 404，不碰磁盘。
+- `-tags dev`：在 root（前端工程目录）上启动 DevServer 并返回它的 handler；`fallback` 不执行，启动失败 panic。
+- `fallback` 必须是构造器（`func() http.Handler`），且应惰性构造 Engine：dev 构建里它不会被执行。
+- `-tags dev` 仍会编译 fallback 所在的包；`//go:embed dist` 的包按 [GUIDE §6.1](GUIDE.md) 拆成 `!dev` 声明 + dev 空 FS 桩。
+- `dev.NewDevServer(root string, opts ...dev.Option)` 仍在 `-tags dev` 构建里可用；选项在依赖探测之前应用，对 `dev.Handler` 同样生效。
 
 | 选项 | 默认 | 契约 |
 | --- | --- | --- |
@@ -438,10 +451,19 @@ func PageFile(url string) string {
 | `WithModulesDir(dir)` | 自动探测 | 显式目录（相对 root 或绝对路径）优先；默认依次看 `<root>/wf_modules`、`<root>/node_modules` 的 manifest 与可用目录，再逐级向上找 `<parent>/wf_modules`，都没有则 `node_modules` |
 | `WithExternal(specs...)` | 所有 root 依赖 | 按包名匹配（含子路径）；命中项在 `/@deps` 打包时保持裸导入，由 import map 复用同一份。传空参数关闭自动外置；入口包自身内部的导入不外置 |
 | `WithDefine(map)` | `process.env.NODE_ENV="development"`；Vue 依赖自动补 `__VUE_*__` | 合并进 dev 的所有 esbuild 构建/转译 define，调用方同名项优先 |
+| `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录：文件按 URL 原样返回（`no-cache`，支持 `Last-Modified`/304），目录请求回目录下的 `index.html`，找不到才回 SPA 外壳。相对 root 或绝对路径均可；传空串关闭。根路径永远给 HMR 外壳，`public/index.html` 顶不掉开发入口 |
 
 外置 CJS 依赖里的 `require("react")` 会被改写成顶部静态 `import * as`，不留下浏览器无法执行的 `__require()`。`/@deps/<pkg>/<file>.css`（如 `nprogress/nprogress.css`）返回"导入即注入 `<style>`"的 ESM，而不是当 JS 入口打包。
 
 ## 10. 版本差异
+
+### v0.1.5 → v0.1.6：tag-free dev 接线与 public/
+
+- 新增 `dev.Handler(root, fallback, opts...)`：生产构建返回 `fallback()`，`-tags dev` 构建返回 DevServer。应用根目录不再需要 `dev_mode.go` + `dev_stub.go`。
+- `dev` 包的重依赖（esbuild / fsnotify / websocket）全部移入 `//go:build dev` 文件；`Option` 改为不依赖 `DevServer` 的 `func(*config)`，两种构建都能编译。
+- `wf dev` 的进程级热重载从 `dev.Supervise` 移到 `dev/supervise`（`supervise.Run` / `supervise.Options`），避免生产构建因 import `dev` 而带上 fsnotify。
+- `-tags dev` 不再要求 `dist` 已构建：GUIDE §6.1 给出 `//go:build` 拆分的 embed 声明与空 FS 桩。
+- `wf build` 复制 `<web>/public/**` 到产物目录（所有产物之后，同名以 public 为准；`-no-public` 关闭；产物目录落在 public 内时拒绝）。`dev.WithPublicDir` 让 dev 期直接托管同一目录。
 
 ### v0.1.4 → v0.1.5：共享 store 与 dev 选项
 
@@ -495,7 +517,7 @@ v0.1.0 的 `Render` 在渲染失败时只返回 error，不写响应；调用方
 | `Render` 不看 `Mode` | 配了 Renderer 就会动态渲染，哪怕有效模式是 `ModeSPA` |
 | 自动识别靠产物 | `dist` 里残留的 `pages/*.html` 会把形态判成静态；`wf build` 会清理固定产物，手动塞入的文件需自己清，或显式写 `Mode` |
 | 构建只清理固定产物 | 在前端工程内部的输出目录里，`ssr.js` / `pages/` / template 下的 `index.html` / `assets/` 会被清理；`-out` 指到工程根或工程外时跳过清理，用户自己放进 `dist` 的其他旧文件仍会被 embed |
-| 无 `public/` 拷贝 | 静态文件需构建后自己放进 `dist/` |
+| 不清理旧 `public/` 文件 | 从 `public/` 删除的文件不会从 `dist/` 自动删除；发布构建前清空产物目录，或手动删除 |
 | 无 Vite 配置 / `import.meta.env` / PostCSS | 别名内置：默认 `@/ → src/`，并读取 `tsconfig` 的 `paths`（`wf build` 与 `wf dev` 一致）；没有 `vite.config` 可配其他别名，见 [接入指南 §8](GUIDE.md) |
 | 无目录列表 / Range | `StaticHandler` 只做整文件 + ETag + gzip |
 | 单次渲染默认 5s 超时 | `jsruntime.NewWithTimeout` / `Pool.SetTimeout` 可调 |

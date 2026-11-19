@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.5 已实现并验证**（v0.1.4 已发布；v0.1.5 新增共享 store 的工程级 manifest、`dev.NewDevServer` 选项与 `/@deps` 外置单例）。最后更新：2026-11-19。
+> **状态：v0.1.6 已实现并验证**（v0.1.5 已发布；v0.1.6 新增免 build tag 的 `dev.Handler`、`dev/supervise` 子包与 `public/` 静态目录）。最后更新：2026-11-19。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.5 |
+| 维度 | 草案 v0 | 现状 v0.1.6 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **6 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cli` / `cmd/wf`） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -97,9 +97,12 @@ webfront/
 ├── jsruntime/           运行期：JS 引擎池（goja）
 │   ├── goja.go            Pool + 宿主 shim + 微任务收口
 │   └── quote.go           JS 字符串字面量转义
-├── dev/                 开发态：esbuild Transform + fsnotify + WS HMR
-│   ├── dev.go            DevServer：按需转译 / @deps / WebSocket
-│   └── supervisor.go     wf dev：进程级热重载（重编译 + 换进程 + 探活）
+├── dev/                 开发态接线：Handler 无 tag；DevServer 本体带 dev tag
+│   ├── handler.go        Handler：普通构建返回 fallback，-tags dev 返回 DevServer
+│   ├── handler_prod.go   //go:build !dev：只做 fallback 透传（纯标准库）
+│   ├── handler_dev.go    //go:build dev：启动 DevServer
+│   ├── dev.go            DevServer：按需转译 / @deps / WebSocket（//go:build dev）
+│   └── supervise/        wf dev：进程级热重载（重编译 + 换进程 + 探活）
 ├── cli/                 CLI 逻辑（可导入：cli.Run 返回退出码，不 os.Exit）
 ├── cmd/wf/              极薄入口：os.Exit(cli.Run(os.Args[1:]))
 ├── _examples/basic/     四形态示例（build tag + 产物切换）+ 前端工程 web/
@@ -152,7 +155,7 @@ type Config struct {
     RootDir     string // 前端工作目录，默认 "./web"
     BasePath    string // 路由挂载前缀，默认 "/"
     Mode        Mode   // 可选；零值自动识别（Renderer → pages/ → index.html）
-    Dev         bool   // true: SSR 错误页显示 goja 栈（HMR 由 wf dev / dev.DevServer 提供）
+    Dev         bool   // true: SSR 错误页显示 goja 栈（HMR 由 dev.Handler 挂载的 DevServer 提供）
     EmbedFS     fs.FS  // 生产环境嵌入的文件系统（//go:embed）
     DistDir     string // 生产产物在 EmbedFS 中的子路径，默认 "dist"
     ServerEntry string // 默认探测 src/entry-server.(tsx|ts)
@@ -299,6 +302,7 @@ r.Handle("/*", eng)
 | `dist/assets/client.js` + `dist/assets/chunks/*.js` | 816 B + 141,787 B | 浏览器 hydration |
 | `dist/pages/*.html` | 479 B / 483 B | 可选，预渲染页面 |
 | `dist/index.html` | 175 B | SPA 回退 / 静态托管 |
+| `dist/<public>/*` | 原样 | 可选，`public/` 里的静态资源（构建最后复制，同名以 public 为准；`-no-public` 关闭） |
 
 ### 4.2 SSR 构建：`Target: ES2017` 的降级策略
 
@@ -637,11 +641,18 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 ## 7. 开发态（package dev）
 
+`dev` 包在普通构建里只剩 `Handler` 与 `Option`（纯标准库）；DevServer 本体、HMR
+客户端、esbuild 与 fsnotify 全部在 `//go:build dev` 文件里。应用侧统一用
+`dev.Handler(root, fallback, opts...)` 接线：普通构建返回 `fallback()`，`-tags dev`
+返回 DevServer 且不执行 fallback——因此根目录不再需要 `dev_mode.go` / `dev_stub.go`。
+`wf dev` 的进程级热重载在 `dev/supervise` 子包（CLI / tools 专用）。
+
 ### 7.1 DevServer 只做三件事
 
 | 路由 | 行为 |
 | --- | --- |
-| `GET /` | 返回注入 HMR 客户端（含错误覆盖层）的 HTML 骨架 |
+| `GET /` | 返回注入 HMR 客户端（含错误覆盖层）的 HTML 骨架；根路径不会被 `public/index.html` 顶掉 |
+| `GET /*`（未命中其他路由） | 先查 `<root>/public`（`WithPublicDir` 可改/关）：普通文件直出，目录回其 `index.html`，仍未命中回 SPA 骨架 |
 | `GET /src/*` | 读源文件 → `esbuild.Transform`（毫秒级）→ 返回 ESM |
 | `GET /@fs/*` | 别名指向 `src/` 之外的项目内文件；越出项目根目录一律 400 |
 | `GET /@deps/*` | 按需打包 npm 裸模块为 ESM 并内存缓存（配合 ImportMap 极速裸导入） |
@@ -679,6 +690,12 @@ esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 
 统一走 `d.url()` 加前缀。因此 `mux.Handle("/admin/", ds.Handler())` 与
 `http.StripPrefix("/admin", ds.Handler())` 两种挂法都可用；调用方不再需要在外面流式改写 HTML。
 
+**public/（`WithPublicDir`）**：与 `wf build` 的 publicDir 约定一致——构建期把
+`<web>/public/**` 复制进 `dist/`，dev 期由 DevServer 直接托管。未命中 `/src`、`/@deps`、
+`/@fs`、`/__wf_*` 的请求先查 `<root>/public`（目录请求回其 `index.html`），仍未命中才回
+SPA 外壳；根路径永远是 HMR 外壳，`public/index.html` 不会顶掉开发入口。`WithPublicDir("static")`
+可改目录，传空串关闭。响应带 `Cache-Control: no-cache` + `Last-Modified`，文件没改就是 304。
+
 **依赖目录探测（`WithModulesDir`）**：显式参数优先；否则依次看 `<root>/wf_modules`、
 `<root>/node_modules` 里有没有 `.store/manifest.json`，再逐级向上找共享的 `<parent>/wf_modules`
 （向上只认 `wf_modules`，避免误用某个祖先目录里无关的 `node_modules`）。共享 store 的
@@ -715,7 +732,7 @@ manifest 按工程分文件，见 §4.6。
 
 **Windows 上的坑**：编辑器"改名式保存"（写 `.tmp` 再 rename）会先发 `Remove` 再发 `Create`。若在 `Remove` 时就广播，浏览器 `import()` 会撞上文件短暂不存在的 404。因此只监听 `Write|Create`，跳过 `Remove|Rename|Chmod`。
 
-### 7.3 Go 侧热重载：Supervise（supervisor.go）
+### 7.3 Go 侧热重载：supervise（dev/supervise/supervise.go）
 
 Go 没有热替换：进程里的机器码换不掉，`plugin` 只在 Linux 上可用且不能卸载。所以
 "Go HMR"只能是**重编译 + 换进程**，工程上真正要解决的是"换得没有存在感"。
@@ -804,7 +821,7 @@ devui.ErrorPage()     独立错误页（SSR/goja 失败时当响应体整页返�
 
 ```bash
 wf install [rootDir]
-wf build   [rootDir]        # 可选：-modules -split -prerender -base -out -mode
+wf build   [rootDir]        # 可选：-modules -split -prerender -base -out -mode -no-public
 wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 ```
 
@@ -812,8 +829,9 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 - `-split`（默认 `true`）：客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE。
 - `-prerender`（默认 `auto`）：存在 `<web>/routes.json` 就预渲染，额外产出 `dist/pages/*.html`，运行期可零引擎；显式传路径照用，传 `-` 关闭。
 - `-modules`（默认 `auto`）：先找有 `.store/manifest.json` 的 `wf_modules` / `node_modules`；否则用存在且有内容的目录（忽略只有空 `.store` 的中断安装）；都没有才落到 `wf_modules`。显式指定时不探测；非 `node_modules` 时自动作为 esbuild 的 `NodePaths`（等价 `NODE_PATH` 语义）。
+- `-no-public`：关闭 `<web>/public` → 产物目录的复制。默认在构建成功后复制，同名文件以 public 为准。
 - `rootDir`：指**包含 `web/` 的目录**；直接指向 `web/` 目录也能用（两个子命令走同一套归一化，见 `webDirOf`）。
-- `wf dev`：`appDir` 是要构建的 main 包；`-tags` 默认 `dev`、`-run` 默认 `dev`（即 `go run -tags dev . dev` 的等价物），`-watch` 默认取 `go.mod` 所在目录。它只负责"重编译 + 换进程"，前端 HMR 仍由应用内的 `dev.DevServer` 提供。
+- `wf dev`：`appDir` 是要构建的 main 包；`-tags` 默认 `dev`、`-run` 默认 `dev`（即 `go run -tags dev .`，`dev` 参数用 `dev.Handler` 后可以忽略），`-watch` 默认取 `go.mod` 所在目录。它只负责"重编译 + 换进程"（实现是 `supervise.Run`），前端 HMR 仍由应用内 `dev.Handler` 挂载的 DevServer 提供。
 
 ### 8.2 build tag 矩阵
 
@@ -821,7 +839,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 | --- | --- | --- |
 | 静态 | `go build .` | `engine_static.go`（`!dynamic`），不 import jsruntime |
 | 动态 | `go build -tags dynamic .` | `engine_dynamic.go` + `jsruntime/goja.go` |
-| 开发 | `wf dev`（或 `go run -tags dev . dev`） | `dev_mode.go`；`dev_stub.go`（`!dev`）保证生产二进制无 esbuild |
+| 开发 | `wf dev`（或 `go run -tags dev .`） | `dev` 包的 `//go:build dev` 文件；`dev.Handler` 在无 tag 构建里返回 fallback，生产二进制无 esbuild / fsnotify / websocket |
 
 三种组合均已 `go build` + `go vet` 通过。
 

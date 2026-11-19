@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.5（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径。
+> **文档对应 v0.1.6（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径；v0.1.6 新增免 build tag 的 `dev.Handler`、独立 `dev/supervise` 与 `public/` 静态目录。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -40,7 +40,7 @@ mux.Handle("/", engine)
 | **纯客户端 SPA** | `wf build -mode spa` + `go build .` | **6.89 MB** | 后台、工具型页面——路由和渲染都在浏览器 |
 | **预渲染静态（SSG）** | `wf build` + `go build .` | **6.89 MB** | 内容站、文档、营销页——构建期出 HTML，运行期只发文件 |
 | **动态 SSR** | `wf build` + `go build -tags dynamic .` | **15.62 MB** | 需要按请求查库、按用户渲染的页面 |
-| **开发服务器** | `wf dev`（`go run -tags dev . dev` 只有前端 HMR） | 11.36 MB | 本地开发：esbuild 单文件转译 + WebSocket HMR；`wf dev` 额外负责改 `.go` 自动重编译重启 |
+| **开发服务器** | `wf dev`（`go run -tags dev .` 只有前端 HMR） | 11.36 MB | 本地开发：esbuild 单文件转译 + WebSocket HMR；`wf dev` 额外负责改 `.go` 自动重编译重启 |
 
 > 四种形态共用同一个 `main.go`：静态 / SPA 走默认构建，动态 SSR 用 `-tags dynamic`，开发服务器用 `-tags dev`。静态与 SPA 的差别只在 `wf build` 的产物，`main.go` 按 `eng.Mode()` 自动分派。引擎有没有被链进二进制，由你 `import` 哪个包决定。
 >
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.5
+go get github.com/plunjoin/webfront@v0.1.6
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.5
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.6
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.5` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.5` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.6` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.6` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -364,7 +364,7 @@ r.Handle("/*", eng)
 
 ```bash
 wf install [rootDir]
-wf build   [rootDir]        # 可选：-modules -split -prerender -base -out -mode（ssr|spa|template）
+wf build   [rootDir]        # 可选：-modules -split -prerender -base -out -mode（ssr|spa|template） -no-public
 wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 ```
 
@@ -386,6 +386,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 | `-base` | `/` | 部署前缀（如 `/site` 或 `/admin`）；资源路径与外壳 HTML 会自动带上 |
 | `-out` | `<webDir>/dist` | 产物输出目录（支持多前端子工程输出到独立子目录） |
 | `-mode` | `ssr` | 构建模式：`ssr`（默认全功能输出）、`spa`（纯客户端 SPA，跳过 SSR）或 `template`（只产 `ssr.js`，给 goja 当模板引擎用） |
+| `-no-public` | `false` | 不把 `<web>/public/**` 复制进产物目录。默认在构建最后复制，同名文件以 public 为准；`dev.DevServer` 开发态还会直接托管 `<root>/public`（`dev.WithPublicDir` 可改/关） |
 | `-tags` | `dev` | `wf dev`：`go build -tags`；置空则不带 tag |
 | `-run` | `dev` | `wf dev`：传给应用的参数（即 `go run -tags dev . dev` 里的那个 `dev`），置空则不带参数 |
 | `-watch` | `go.mod` 所在目录 | `wf dev`：监听根目录；默认整个模块，改子包也会重启 |
@@ -401,7 +402,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 | `wf build`（SSR） | `compiler.BuildSSRWith` |
 | `wf build`（客户端） | `compiler.BuildClientSplit` / `BuildClientWith` |
 | `wf build -prerender` | `compiler.ReadRoutes` + `PrerenderWithBase` |
-| `wf dev` | `dev.Supervise`（或自己起 `dev.NewDevServer`） |
+| `wf dev` | `supervise.Run`（或自己起 `dev.NewDevServer`，仅 `-tags dev` 构建） |
 
 ### 嵌入自己的工具入口（可选）
 
@@ -458,14 +459,14 @@ web/wf_modules/.store/manifest.json                  # 所有工程合并版（�
 
 ```bash
 cd _examples/basic
-wf dev            # 前端 HMR 同 go run -tags dev . dev；额外负责改 .go 自动重启
+wf dev            # 前端 HMR 同 go run -tags dev .；额外负责改 .go 自动重启
 ```
 
 Go 进程里的机器码换不掉，所以这里不是"热替换"，而是**重编译 + 换进程**——但把换的过程做得没有存在感：
 
 - **先编译，编译通过才动旧进程**。写错一个分号时页面还活着、继续用上一版代码，编译器报错直接打在终端；改好自动重启。
 - **浏览器自动恢复**。进程重启时 WebSocket 断开，客户端不立刻 `reload()`（那会撞上"无法连接"的错误页），而是盖上"后端重启中"的覆盖层，轮询 `/__wf_ping`，等服务回来再整页重载。
-- **前端不重启**。`web/src` 下的 tsx / vue / css 仍由应用内的 `dev.DevServer` 走进程内 HMR，改样式、改组件不会触发 Go 重编译。
+- **前端不重启**。`web/src` 下的 tsx / vue / css 仍由应用内 `dev.Handler` 挂载的 DevServer 走进程内 HMR，改样式、改组件不会触发 Go 重编译。
 - **崩了也能自己起来**。子进程 panic 退出后监听不中断，改完代码自动拉起。
 - 监听范围是整个模块（`go.mod` 所在目录，含子包），跳过 `node_modules` / `wf_modules` / `dist` / `vendor` / `.git`，也跳过 `*_test.go` 和编辑器临时文件。
 
@@ -479,10 +480,22 @@ Go 进程里的机器码换不掉，所以这里不是"热替换"，而是**重�
 
 代价是重启窗口内（通常 2–3s）的请求会失败——这是进程级重启绕不开的；需要零中断就得自己做多进程热切，不在本项目的取舍范围内。
 
-### 应用内挂载：`dev.NewDevServer` 的选项
+### 应用内挂载：`dev.Handler` 与选项
 
-`wf dev` 只是推荐入口；需要把 dev server 嵌进自己的路由时，`NewDevServer` 的可选项
-覆盖了子路径部署与常见框架配置：
+`wf dev` 只是推荐入口；应用里统一用 `dev.Handler` 接线，**没有 build tag、也不再需要
+`dev_mode.go` + `dev_stub.go` 两个文件**：
+
+```go
+// 普通构建：返回 fallback()；-tags dev：在该 root 上启动 DevServer，fallback 不执行。
+mux.Handle("/admin/", dev.Handler("web/admin", adminHandler, dev.WithBasePath("/admin")))
+mux.Handle("/", dev.Handler("web/portal", func() http.Handler { return portalHandler(db) }))
+```
+
+`fallback` 必须是构造器（`func() http.Handler`），里面再 `newEngine()`；dev 构建不会
+执行它，所以不要求 `dist` 已构建。`-tags dev` 仍会编译 fallback 所在的包，若它用
+`//go:embed all:dist`，按 [GUIDE §6.1](docs/GUIDE.md) 拆成 `!dev` 声明 + dev 空 FS 桩。
+
+需要自己管理 DevServer 时，`NewDevServer` 在 `-tags dev` 构建里仍然可用，选项一致：
 
 ```go
 ds, err := dev.NewDevServer("./web",
@@ -497,12 +510,15 @@ if err != nil { log.Fatal(err) }
 mux.Handle("/admin/", ds.Handler())   // import map / HMR / 广播都会带 /admin 前缀
 ```
 
+选项对 `dev.Handler` 与 `dev.NewDevServer` 都适用（生产构建里 `dev.Handler` 会忽略它们）：
+
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
-| `WithBasePath(p)` | 无前缀 | 壳 HTML、import map、HMR WebSocket 与广播 path 全部带上 `p`；`mux.Handle(p+"/", ds.Handler())` 即可 |
+| `WithBasePath(p)` | 无前缀 | 壳 HTML、import map、HMR WebSocket 与广播 path 全部带上 `p`；`mux.Handle(p+"/", h)` 即可 |
 | `WithModulesDir(dir)` | 自动探测 | 依次看 `<root>/wf_modules`、`<root>/node_modules`，再逐级向上找共享 `wf_modules`；可传相对/绝对路径 |
 | `WithExternal(specs...)` | 所有 root 依赖 | 打包 `/@deps/<pkg>.js` 时把别的 root 依赖留成裸导入，由 import map 复用同一份模块（react-dom 不再内联 react）；传空参数关闭 |
 | `WithDefine(map)` | `NODE_ENV=development`（Vue 项目自动补 `__VUE_*__`） | 合并进 esbuild 的 define，自定义项优先 |
+| `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录；目录请求回其 `index.html`，找不到才回 SPA 外壳。传空串关闭；根路径永远给 HMR 外壳 |
 
 `/@deps` 还支持 CSS 子路径：`import "nprogress/nprogress.css"` 会返回一个
 "导入即注入 `<style>`" 的 ESM 模块，不需要调用方自己处理样式文件。外置的 CJS 依赖
@@ -515,11 +531,13 @@ mux.Handle("/admin/", ds.Handler())   // import map / HMR / 广播都会带 /adm
 
 | 构建 | 命令 | 链接了什么 |
 | --- | --- | --- |
-| 静态 | `go build .` | 只有核心包（stdlib） |
+| 静态 | `go build .` | 只有核心包（stdlib）；`dev` 只编译 `Handler` 与选项 |
 | 动态 | `go build -tags dynamic .` | + `jsruntime`（goja，+9.5MB） |
-| 开发 | `wf dev`（或 `go run -tags dev . dev`） | + `dev`（esbuild + fsnotify + websocket，+4.5MB） |
+| 开发 | `wf dev`（或 `go run -tags dev .`） | + `dev` 的 `//go:build dev` 文件（esbuild + fsnotify + websocket，+4.5MB） |
 
-`go build ./...` 不会碰示例目录（`_examples` 前缀被 Go 工具链跳过），所以库本身永远能干净编译。
+`dev.Handler` 在普通构建里原样返回 fallback，所以接线代码可以只有一份；esbuild / fsnotify /
+websocket 不会因为 import `dev` 就进生产二进制。`go build ./...` 不会碰示例目录
+（`_examples` 前缀被 Go 工具链跳过），所以库本身永远能干净编译。
 
 ---
 
@@ -613,7 +631,7 @@ go run ./cmd/wf build ./_examples/basic
 cd _examples/basic
 go run .                       # 静态，7.0MB
 go run -tags dynamic .         # 动态 SSR，15.6MB
-go run -tags dev . dev         # 开发服务器（改 web/src 即热更）
+go run -tags dev .             # 开发服务器（改 web/src 即热更）
 
 # 纯 SPA：回仓库根重建 SPA 产物，再 go run .
 # go run ./cmd/wf build -mode spa ./_examples/basic
@@ -628,12 +646,19 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.5 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.6 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+
+### v0.1.6 相对 v0.1.5
+
+- **dev 接线免 build tag**：`dev.Handler(root, fallback, opts...)` 在普通构建返回 `fallback()`，`-tags dev` 构建返回 DevServer；esbuild / fsnotify / websocket 全在 `//go:build dev` 文件里，应用不再需要 `dev_mode.go` + `dev_stub.go`
+- **`public/` 静态目录**：`wf build` 在所有产物之后复制 `<web>/public/**`（同名以 public 为准，`-no-public` 关闭）；dev 期由 `WithPublicDir` 直接托管，根路径仍给 HMR 外壳
+- **`dev/supervise`**：`wf dev` 的进程级热重载移到 `dev/supervise`（`supervise.Run` / `supervise.Options`），不再从 `dev` 包带出 fsnotify
+- **`-tags dev` 不要求 dist**：示例用 `embed.go`（`!dev`）+ `embed_dev.go`（空 FS）拆分 embed，开发构建无需先跑 `wf build`
 
 ### v0.1.5 相对 v0.1.4
 
