@@ -1,3 +1,7 @@
+//go:build dev
+
+// client.go：注入 dev 页面的 HMR / 错误覆盖层客户端脚本。
+// 只有 DevServer 使用，跟着 dev.go 一起隔离在 dev tag 里。
 package dev
 
 import (

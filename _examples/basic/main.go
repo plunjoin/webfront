@@ -11,34 +11,35 @@
 //	go build -ldflags "-s -w" -o app.exe .               → 预渲染静态（无引擎，7.0MB）
 //	go build -tags dynamic -ldflags "-s -w" -o app.exe . → 动态 SSR / goja（15.6MB）
 //	go build -tags dev -ldflags "-s -w" -o app.exe .     → 开发服务器（esbuild + HMR，11.4MB）
-//	go run -tags dev . dev                               → 开发模式（带 HMR 热更）
+//	go run -tags dev .                                   → 开发模式（带 HMR 热更）
 //	wf dev                                               → 同上，且改 .go 自动重启
 //
-// 默认构建 **不 import** jsruntime / compiler / dev：那会把 JS 引擎（9.5MB）和
-// esbuild 一起链进二进制。构建统一走 wf CLI。
+// 接线只有 dev.Handler 一处：普通构建原样返回 fallback，-tags dev 构建由
+// DevServer 接管。默认构建不 import jsruntime / compiler，也不会因为 import
+// dev 而带上 esbuild / fsnotify / websocket（那些文件都带 //go:build dev）。
 package main
 
 import (
-	"embed"
 	"fmt"
 	"net/http"
-	"os"
 
 	"github.com/plunjoin/webfront"
+	"github.com/plunjoin/webfront/dev"
 )
 
-//go:embed all:web/dist
-var distFS embed.FS
-
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "dev" {
-		runDev()
-		return
+	mux := http.NewServeMux()
+	// dev 构建：./web 的前端由 DevServer 接管；生产构建：fallback 原样返回。
+	mux.Handle("/", dev.Handler("./web", prodHandler))
+	fmt.Println("✅ webfront demo on http://localhost:8080")
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		panic(err)
 	}
-	runSSR()
 }
 
-func runSSR() {
+// prodHandler 延迟到普通构建才执行：dev 构建里不会调用它，所以不要求
+// web/dist 已经构建好（embed 声明也已拆到 !dev / dev 两个文件）。
+func prodHandler() http.Handler {
 	eng, err := newEngine()
 	if err != nil {
 		panic(err)
@@ -80,8 +81,6 @@ func runSSR() {
 			})
 		})
 	}
-	fmt.Println("✅ webfront demo on http://localhost:8080  （" + desc + "）")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
-		panic(err)
-	}
+	fmt.Println("   形态：" + desc)
+	return mux
 }

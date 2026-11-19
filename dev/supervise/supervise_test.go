@@ -1,4 +1,4 @@
-package dev
+package supervise
 
 import (
 	"bytes"
@@ -73,7 +73,7 @@ func TestSuperviseRebuildsOnGoChange(t *testing.T) {
 	out := &lockedBuf{}
 	done := make(chan error, 1)
 	go func() {
-		done <- Supervise(ctx, SuperviseOptions{
+		done <- Run(ctx, Options{
 			Dir:      dir,
 			WatchDir: dir,
 			Out:      out,
@@ -112,10 +112,10 @@ func TestSuperviseRebuildsOnGoChange(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Supervise 返回错误: %v", err)
+			t.Fatalf("Run 返回错误: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("cancel 后 Supervise 没有退出")
+		t.Fatal("cancel 后 Run 没有退出")
 	}
 
 	if logText := out.String(); !bytes.Contains([]byte(logText), []byte("编译通过")) {
@@ -142,7 +142,7 @@ func TestSuperviseKeepsOldProcessOnBuildError(t *testing.T) {
 
 	out := &lockedBuf{}
 	go func() {
-		_ = Supervise(ctx, SuperviseOptions{Dir: dir, WatchDir: dir, Out: out})
+		_ = Run(ctx, Options{Dir: dir, WatchDir: dir, Out: out})
 	}()
 
 	waitFor(t, 60*time.Second, "首次启动写出版本 v1", func() bool {

@@ -1,3 +1,8 @@
+//go:build dev
+
+// dev.go：DevServer 本体。文件带 dev tag——生产构建 import 本包时只编译
+// handler.go / options.go 这些轻量文件，esbuild、fsnotify、websocket 都不会
+// 进二进制。
 package dev
 
 import (
@@ -37,6 +42,11 @@ type DevServer struct {
 
 	// 挂载前缀（"" 表示根路径）：生成的 URL、import map、HMR 地址都带上它。
 	basePath string
+
+	// 开发态静态资源目录（Vite publicDir 约定）：未命中内部路由的请求回退到
+	// 这里的文件，仍找不到才回 SPA 外壳。默认 <root>/public，WithPublicDir 可改/关闭。
+	publicDir string
+	publicSet bool
 
 	// esbuild define 表：默认 NODE_ENV=development，Vue 项目自动补特性开关，
 	// 用户通过 WithDefine 追加的项最后覆盖。
@@ -120,8 +130,20 @@ func NewDevServer(root string, opts ...Option) (*DevServer, error) {
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
-	for _, opt := range opts {
-		opt(d)
+	d.applyConfig(newConfig(opts))
+
+	// public/：显式 WithPublicDir 优先，否则用 <root>/public（存在才托管）。
+	// 路径启动时固定，但每次请求都重新 stat，运行中新建的 public/ 也能生效。
+	if !d.publicSet {
+		d.publicDir = "public"
+	}
+	if d.publicDir != "" {
+		if !filepath.IsAbs(d.publicDir) {
+			d.publicDir = filepath.Join(abs, d.publicDir)
+		}
+		if fi, err := os.Stat(d.publicDir); err == nil && fi.IsDir() {
+			fmt.Printf("[public] serving %s\n", d.publicDir)
+		}
 	}
 
 	// 依赖目录与 root 依赖：显式 WithModulesDir 优先，否则自底向上探测。
@@ -331,8 +353,48 @@ func (d *DevServer) serveLastError(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(e)
 }
 
+// servePublic 用 public 目录里的文件响应请求，命中返回 true。
+// 未命中（未配置 / 不存在 / 不是普通文件）返回 false，由调用方继续走 SPA 外壳。
+// 目录请求按 Vite 的惯例回目录下的 index.html。
+func (d *DevServer) servePublic(w http.ResponseWriter, r *http.Request) bool {
+	if d.publicDir == "" {
+		return false
+	}
+	rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+	full := filepath.Join(d.publicDir, filepath.FromSlash(rel))
+	if _, ok := relWithin(d.publicDir, full); !ok {
+		return false
+	}
+	fi, err := os.Stat(full)
+	if err != nil {
+		return false
+	}
+	if fi.IsDir() {
+		full = filepath.Join(full, "index.html")
+		if fi, err = os.Stat(full); err != nil || fi.IsDir() {
+			return false
+		}
+	}
+	if !fi.Mode().IsRegular() {
+		return false
+	}
+	// dev 态让浏览器每次回源校验；ServeFile 带 Last-Modified，文件没改就是 304。
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeFile(w, r, full)
+	return true
+}
+
 // serveIndex 注入 HMR 客户端脚本 + ImportMap + 模块入口。
 func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
+	// public/：内部路由（/src、/@deps、/@fs、/__wf_*）由 mux 的精确前缀先行命中，
+	// 剩下的路径先看 <root>/public；根路径永远给 HMR 外壳，public/index.html
+	// 不能把开发入口顶掉。
+	if p := strings.TrimPrefix(path.Clean(r.URL.Path), "/"); p != "" && p != "index.html" {
+		if d.servePublic(w, r) {
+			return
+		}
+	}
+
 	importMap := map[string]any{
 		"imports": map[string]string{},
 	}

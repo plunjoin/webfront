@@ -1,20 +1,46 @@
 package dev
 
-// options.go：DevServer 的可选配置。
+// options.go：DevServer 与 dev.Handler 的可选配置。
 //
 // 零配置仍是默认形态（NewDevServer("./web")），下面的选项只解决"要挂到别处"
 // 的场景：子路径部署、共享依赖目录、框架 runtime 单例、自定义 define。
+//
+// 本文件不带 build tag：生产构建也会编译它，所以这里不能 import esbuild /
+// fsnotify 等只有开发态才需要的包。DevServer 专属的接线在 options_dev.go。
 
 import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/evanw/esbuild/pkg/api"
 )
 
-// Option 修改 DevServer 的默认行为。在 NewDevServer 探测依赖之前生效。
-type Option func(*DevServer)
+// Option 修改 dev server 的默认行为。在 NewDevServer 探测依赖之前生效。
+//
+// 生产构建（没有 -tags dev）里 dev.Handler 不会使用选项：它们只影响
+// -tags dev 构建出来的 DevServer。
+type Option func(*config)
+
+// config 是 Option 的载体。它不带 build tag，两种构建都能编译。
+type config struct {
+	basePath    string
+	modulesDir  string
+	define      map[string]string
+	externals   map[string]bool
+	externalSet bool
+	publicDir   string
+	publicSet   bool
+}
+
+// newConfig 依次应用选项。nil 选项直接跳过，方便调用方按条件构造。
+func newConfig(opts []Option) *config {
+	c := &config{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
+}
 
 // WithBasePath 让 dev server 整体挂在前缀下（如 "/admin"）。
 //
@@ -25,8 +51,8 @@ type Option func(*DevServer)
 //
 // 传入 "/" 或空串等价于不挂前缀；末尾斜杠会被去掉。
 func WithBasePath(p string) Option {
-	return func(d *DevServer) {
-		d.basePath = normalizeBasePath(p)
+	return func(c *config) {
+		c.basePath = normalizeBasePath(p)
 	}
 }
 
@@ -35,8 +61,20 @@ func WithBasePath(p string) Option {
 // 默认按 <root>/wf_modules → <root>/node_modules → 逐级向上的 wf_modules
 // 探测（与 CLI 的 -modules auto 同一套规则）。
 func WithModulesDir(dir string) Option {
-	return func(d *DevServer) {
-		d.modulesDir = dir
+	return func(c *config) {
+		c.modulesDir = dir
+	}
+}
+
+// WithPublicDir 指定开发态静态资源目录（默认 <root>/public）。
+//
+// 未命中内部路由的请求会回退到该目录（Vite 的 publicDir 约定）：目录内的文件
+// 按 URL 原样提供，仍找不到才回 SPA 外壳。目录可相对 root 或为绝对路径；
+// 传空串关闭 public 目录托管。与 wf build 的约定一致：构建期复制、开发期直出。
+func WithPublicDir(dir string) Option {
+	return func(c *config) {
+		c.publicSet = true
+		c.publicDir = dir
 	}
 }
 
@@ -47,12 +85,12 @@ func WithModulesDir(dir string) Option {
 // 默认已含 process.env.NODE_ENV=development，检测到 Vue 依赖时再补
 // __VUE_OPTIONS_API__ / __VUE_PROD_DEVTOOLS__ 等特性开关。
 func WithDefine(m map[string]string) Option {
-	return func(d *DevServer) {
-		if d.userDefine == nil {
-			d.userDefine = map[string]string{}
+	return func(c *config) {
+		if c.define == nil {
+			c.define = map[string]string{}
 		}
 		for k, v := range m {
-			d.userDefine[k] = v
+			c.define[k] = v
 		}
 	}
 }
@@ -65,12 +103,12 @@ func WithDefine(m map[string]string) Option {
 // 不调用该选项时，默认把所有 root 依赖（manifest.Root / package.json
 // dependencies）外置，效果与 Vite 的 optimizeDeps 单例一致；传空参数则关闭自动外置。
 func WithExternal(specs ...string) Option {
-	return func(d *DevServer) {
-		d.externalSet = true
-		d.externals = map[string]bool{}
+	return func(c *config) {
+		c.externalSet = true
+		c.externals = map[string]bool{}
 		for _, s := range specs {
 			if pkg := packageOf(strings.TrimSpace(s)); pkg != "" {
-				d.externals[pkg] = true
+				c.externals[pkg] = true
 			}
 		}
 	}
@@ -90,11 +128,6 @@ func normalizeBasePath(p string) string {
 		return ""
 	}
 	return p
-}
-
-// url 给 dev server 自己的路径加挂载前缀。
-func (d *DevServer) url(p string) string {
-	return d.basePath + p
 }
 
 // packageOf 取裸 specifier 的包名（"@scope/pkg/sub" → "@scope/pkg"）。
@@ -195,25 +228,4 @@ func hasVue(rootDeps map[string]string) bool {
 		}
 	}
 	return false
-}
-
-// externalPlugin 把命中列表的裸导入标记为 external，交给浏览器的 import map
-// 解析；entryPkg 自己的内部导入不外置，避免把同一个包拆成多份。
-func externalPlugin(externals map[string]bool, entryPkg string) api.Plugin {
-	return api.Plugin{
-		Name: "webfront-dev-external",
-		Setup: func(b api.PluginBuild) {
-			b.OnResolve(api.OnResolveOptions{Filter: `^[^./]`}, func(args api.OnResolveArgs) (api.OnResolveResult, error) {
-				// 入口点本身（importer 为空）必须打包，否则产物只剩一句自引用 import。
-				if args.Importer == "" || args.Kind == api.ResolveEntryPoint {
-					return api.OnResolveResult{}, nil
-				}
-				pkg := packageOf(args.Path)
-				if pkg == "" || pkg == entryPkg || !externals[pkg] {
-					return api.OnResolveResult{}, nil
-				}
-				return api.OnResolveResult{Path: args.Path, External: true}, nil
-			})
-		},
-	}
 }

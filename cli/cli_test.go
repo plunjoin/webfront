@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -239,6 +240,74 @@ func TestRunBuildTemplateOutSourceDirKeepsFiles(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(web, filepath.FromSlash(p))); err != nil {
 			t.Fatalf("%s 不应被删除: %v", p, err)
 		}
+	}
+}
+
+// public/ 是构建期静态资源目录：wf build 结束时原样复制进 dist，
+// 与构建产物同名时以 public 为准。
+func TestRunBuildCopiesPublic(t *testing.T) {
+	web := filepath.Join(t.TempDir(), "web")
+	writeTestFile(t, filepath.Join(web, "src", "entry-client.tsx"), "document.getElementById('root')\n")
+	writeTestFile(t, filepath.Join(web, "public", "brand", "logo.svg"), "<svg>logo</svg>")
+	writeTestFile(t, filepath.Join(web, "public", "players", "p1.json"), `{"id":1}`)
+	writeTestFile(t, filepath.Join(web, "public", "index.html"), "public-index")
+
+	if code := Run([]string{"build", "-mode", "spa", web}); code != 0 {
+		t.Fatalf("build exit = %d", code)
+	}
+	for path, want := range map[string]string{
+		"brand/logo.svg":  "<svg>logo</svg>",
+		"players/p1.json": `{"id":1}`,
+		"index.html":      "public-index", // 同名时 public 覆盖 wf build 生成的 SPA 外壳
+	} {
+		b, err := os.ReadFile(filepath.Join(web, "dist", filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatalf("%s 未复制: %v", path, err)
+		}
+		if string(b) != want {
+			t.Fatalf("%s = %q, want %q", path, b, want)
+		}
+	}
+}
+
+// template 模式也复制 public/：它只产 ssr.js，但静态资源仍要进 embed 的 dist。
+func TestRunBuildTemplateCopiesPublic(t *testing.T) {
+	web := filepath.Join(t.TempDir(), "web")
+	writeTestFile(t, filepath.Join(web, "src", "entry-server.tsx"), "export function render(){ return { html: 'x', head: '' } }\n")
+	writeTestFile(t, filepath.Join(web, "public", "robots.txt"), "User-agent: *\n")
+
+	if code := Run([]string{"build", "-mode", "template", web}); code != 0 {
+		t.Fatalf("build exit = %d", code)
+	}
+	b, err := os.ReadFile(filepath.Join(web, "dist", "robots.txt"))
+	if err != nil || string(b) != "User-agent: *\n" {
+		t.Fatalf("dist/robots.txt = %q, %v", b, err)
+	}
+}
+
+func TestRunBuildNoPublic(t *testing.T) {
+	web := filepath.Join(t.TempDir(), "web")
+	writeTestFile(t, filepath.Join(web, "src", "entry-client.tsx"), "document.getElementById('root')\n")
+	writeTestFile(t, filepath.Join(web, "public", "logo.svg"), "<svg>logo</svg>")
+
+	if code := Run([]string{"build", "-mode", "spa", "-no-public", web}); code != 0 {
+		t.Fatalf("build exit = %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(web, "dist", "logo.svg")); !os.IsNotExist(err) {
+		t.Fatalf("logo.svg 不应被复制（err=%v）", err)
+	}
+	b, err := os.ReadFile(filepath.Join(web, "dist", "index.html"))
+	if err != nil || !strings.Contains(string(b), "/assets/client.js") {
+		t.Fatalf("index.html 应是构建生成的 SPA 外壳: %q, %v", b, err)
+	}
+}
+
+// 产物目录落在 public/ 内时拒绝复制：否则边遍历边写入会无限递归。
+func TestCopyPublicRejectsOutputInsidePublic(t *testing.T) {
+	web := t.TempDir()
+	writeTestFile(t, filepath.Join(web, "public", "a.txt"), "a")
+	if _, _, err := copyPublic(filepath.Join(web, "public"), filepath.Join(web, "public", "dist")); err == nil {
+		t.Fatal("产物目录位于 public 内时应报错")
 	}
 }
 

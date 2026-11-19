@@ -1,4 +1,13 @@
-package dev
+// Package supervise 实现 `wf dev` 的 Go 侧热重载：先编译，编译通过才换进程；
+// 编译失败时旧进程继续服务。
+//
+// 它和 dev.Handler 分工不同：前端（tsx/vue/css）的热更由应用内挂载的 dev
+// server 负责，本包只监听 *.go / go.mod / go.sum，重新编译并重启进程。
+//
+// 本包依赖 fsnotify，只应该被 CLI 或 tools/ 导入，不要放进线上服务。
+// 这也正是它没有待在 dev 包里的原因：dev 包要在生产构建里也能 import
+// （见 dev.Handler），不能带上 fsnotify。
+package supervise
 
 // 进程级热重载：Go 没有"热替换代码"这回事，进程里的机器码换不掉。所以这里
 // 的"Go HMR"只能是重新编译 + 换进程，但把换的过程做得足够无感：
@@ -33,8 +42,8 @@ const (
 	killGrace = 3 * time.Second
 )
 
-// SuperviseOptions 控制 wf dev 的行为。
-type SuperviseOptions struct {
+// Options 控制 wf dev 的行为。
+type Options struct {
 	Dir       string    // 要构建/运行的包目录（go build 的 .）
 	Tags      string    // go build -tags，空串表示不带 tag
 	RunArgs   []string  // 传给子进程的参数
@@ -44,7 +53,7 @@ type SuperviseOptions struct {
 }
 
 type supervisor struct {
-	opt    SuperviseOptions
+	opt    Options
 	tmpDir string
 	log    io.Writer
 
@@ -59,9 +68,9 @@ type running struct {
 	done chan struct{}
 }
 
-// Supervise 构建并运行 Dir 指向的包；Go 源码变更时重新编译、重启进程。
+// Run 构建并运行 Dir 指向的包；Go 源码变更时重新编译、重启进程。
 // ctx 取消时杀掉子进程并清理临时产物。
-func Supervise(ctx context.Context, opt SuperviseOptions) error {
+func Run(ctx context.Context, opt Options) error {
 	if opt.Dir == "" {
 		opt.Dir = "."
 	}
@@ -96,7 +105,7 @@ func Supervise(ctx context.Context, opt SuperviseOptions) error {
 	s.watchDirs(w, opt.WatchDir)
 
 	s.printf("监听 %s（*.go / go.mod）→ 重新编译并重启", filepath.ToSlash(opt.WatchDir))
-	s.printf("前端热更由应用内的 dev.DevServer 负责（web/src 变更不会重启进程）")
+	s.printf("前端热更由应用内的 dev server 负责（web/src 变更不会重启进程）")
 	if _, err := s.rebuild(); err != nil {
 		s.printf("✗ 首次构建失败，仍在监听（修好后自动启动）")
 	}
@@ -284,6 +293,15 @@ func (s *supervisor) watchDirs(w *fsnotify.Watcher, root string) {
 		}
 		return nil
 	})
+}
+
+// ignoredDir 与 dev.ignoredDir 保持一致：这两处监听的目录集合故意相同。
+func ignoredDir(name string) bool {
+	switch name {
+	case "node_modules", "wf_modules", "dist", ".git", ".store", "vendor":
+		return true
+	}
+	return false
 }
 
 // isGoChange 判断这个文件变更是否需要重新编译。

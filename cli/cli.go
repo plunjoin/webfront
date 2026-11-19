@@ -15,7 +15,7 @@
 //	func main() { os.Exit(cli.Run(os.Args[1:])) }
 //
 // 然后 `go run ./tools/wf build -modules wf_modules ./web`。
-// 注意：import 本包会把 esbuild / fsnotify / websocket 带进这个二进制的依赖图，
+// 注意：import 本包会把 esbuild / fsnotify 带进这个二进制的依赖图，
 // 所以只应该放在 tools 目录（或用 //go:build tools 隔开），不要放进线上服务。
 package cli
 
@@ -23,6 +23,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,7 +32,7 @@ import (
 
 	"github.com/plunjoin/webfront"
 	"github.com/plunjoin/webfront/compiler"
-	"github.com/plunjoin/webfront/dev"
+	"github.com/plunjoin/webfront/dev/supervise"
 )
 
 func usage() {
@@ -49,6 +50,7 @@ usage:
 可选参数（都有默认值，通常不用写）：
   -modules auto   -split=true   -prerender auto   -base /   -out <web>/dist   -mode ssr
   -prerender -    关闭自动预渲染
+  -no-public      不把 <web>/public 复制进产物目录（默认复制，同名以 public 为准）
   -mode template  只产 ssr.js（把 React/Vue 当 goja 模板引擎用，不需要客户端入口）
 
 dev: 构建并运行 appDir 里的 main 包，Go 源码变更时自动重新编译、重启进程；
@@ -83,6 +85,7 @@ func Run(args []string) int {
 	base := fs.String("base", "/", "部署前缀（如 /site）；预渲染注入的资源路径会带上它，与 webfront.Config.BasePath 保持一致")
 	out := fs.String("out", "", "产物输出目录（默认 <webDir>/dist）")
 	mode := fs.String("mode", "ssr", "构建模式：ssr（默认）、spa（纯客户端 SPA）或 template（只产 ssr.js，给 goja 当模板引擎用）")
+	noPublic := fs.Bool("no-public", false, "不把 <web>/public 复制进产物目录")
 	tags := fs.String("tags", "dev", "wf dev：go build -tags（默认 dev；置空则不带 tag）")
 	runArgs := fs.String("run", "dev", "wf dev：传给应用的参数（默认 dev，置空则不带参数）")
 	watch := fs.String("watch", "", "wf dev：监听根目录（默认取 go.mod 所在目录）")
@@ -108,7 +111,7 @@ func Run(args []string) int {
 
 	switch cmd {
 	case "build":
-		return runBuild(root, *modules, *split, *prerender, *base, *out, *mode)
+		return runBuild(root, *modules, *split, *prerender, *base, *out, *mode, *noPublic)
 	case "install":
 		// 纯 Go lockfile 驱动安装器：读 package-lock.json 物化版本化 store（零 Node）。
 		// 与 build 一致：rootDir 指"包含 web/ 的目录"，也可直接指向 web 目录。
@@ -125,7 +128,7 @@ func Run(args []string) int {
 		// 前端热更仍由应用内挂载的 dev.DevServer 负责，两条链路互不干扰。
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		opt := dev.SuperviseOptions{
+		opt := supervise.Options{
 			Dir:      root,
 			Tags:     *tags,
 			RunArgs:  strings.Fields(*runArgs),
@@ -134,7 +137,7 @@ func Run(args []string) int {
 		if *ldflags != "" {
 			opt.BuildArgs = []string{"-ldflags", *ldflags}
 		}
-		if err := dev.Supervise(ctx, opt); err != nil {
+		if err := supervise.Run(ctx, opt); err != nil {
 			fmt.Println("✗ dev:", err)
 			return 1
 		}
@@ -147,7 +150,7 @@ func Run(args []string) int {
 }
 
 // runBuild 是 `wf build` 的实现，返回退出码。
-func runBuild(root, modulesFlag string, split bool, prerenderFlag, base, out, mode string) int {
+func runBuild(root, modulesFlag string, split bool, prerenderFlag, base, out, mode string, noPublic bool) int {
 	if !validMode(mode) {
 		fmt.Printf("✗ 未知 -mode %q（可选 ssr / spa / template）\n", mode)
 		return 1
@@ -202,6 +205,9 @@ func runBuild(root, modulesFlag string, split bool, prerenderFlag, base, out, mo
 			removeStale(distDir, "index.html", "pages", "assets")
 		} else {
 			fmt.Println("ℹ️ 产物目录不在前端工程内，跳过过期产物清理（请自行确认目录内容）")
+		}
+		if code := copyPublicToDist(webDir, distDir, noPublic); code != 0 {
+			return code
 		}
 		fmt.Printf("✅ SSR bundle  -> %s/ssr.js (%d bytes)\n", filepath.ToSlash(distDir), len(ssr))
 		fmt.Println("   ↳ template 模式：只产 ssr.js；运行期用 jsruntime.New + RenderTemplate，不需要客户端入口")
@@ -352,8 +358,106 @@ func runBuild(root, modulesFlag string, split bool, prerenderFlag, base, out, mo
 	} else {
 		fmt.Println("ℹ️ 产物目录不在前端工程内，跳过过期产物清理（请自行确认目录内容）")
 	}
+	// 5) public/：放在所有构建产物之后复制，同名文件以 public/ 为准。
+	if code := copyPublicToDist(webDir, distDir, noPublic); code != 0 {
+		return code
+	}
 	fmt.Println("🎁 产物已就绪，可被 //go:embed 打进单文件二进制（见 _examples/basic）")
 	return 0
+}
+
+// copyPublicToDist 把 <web>/public 复制进产物目录（Vite 的 publicDir 约定）。
+// 构建成功后才调用：同名文件以 public/ 为准。返回非 0 表示构建失败。
+func copyPublicToDist(webDir, distDir string, disabled bool) int {
+	src := filepath.Join(webDir, "public")
+	fi, err := os.Stat(src)
+	if err != nil || !fi.IsDir() {
+		return 0
+	}
+	if disabled {
+		fmt.Println("ℹ️ -no-public：跳过 public/ 复制")
+		return 0
+	}
+	copied, replaced, err := copyPublic(src, distDir)
+	if err != nil {
+		fmt.Println("✗ copy public:", err)
+		return 1
+	}
+	if copied == 0 {
+		return 0
+	}
+	extra := ""
+	if replaced > 0 {
+		extra = fmt.Sprintf("，覆盖同名产物 %d 个", replaced)
+	}
+	fmt.Printf("✅ Public       -> %s/ (%d files%s)\n", filepath.ToSlash(distDir), copied, extra)
+	return 0
+}
+
+// copyPublic 把 src 下的普通文件按相对路径复制进 distDir，返回复制数与
+// 覆盖数（目标已存在）。软链按文件内容复制；指向目录的软链不展开。
+func copyPublic(src, distDir string) (copied, replaced int, err error) {
+	// 产物目录落在 public/ 内时拒绝：边遍历边写入会无限递归，
+	// 产物自己也会被当成静态资源再拷一遍。
+	if rel, relErr := filepath.Rel(src, distDir); relErr == nil && isWithinRel(rel) {
+		return 0, 0, fmt.Errorf("产物目录 %s 位于 public/ 内", filepath.ToSlash(distDir))
+	}
+	err = filepath.WalkDir(src, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, statErr := os.Stat(p) // 跟随软链；指向目录的软链由 IsRegular 过滤
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(src, p)
+		if relErr != nil {
+			return relErr
+		}
+		dst := filepath.Join(distDir, rel)
+		if _, statErr := os.Stat(dst); statErr == nil {
+			replaced++
+		}
+		if mkErr := os.MkdirAll(filepath.Dir(dst), 0o755); mkErr != nil {
+			return mkErr
+		}
+		if cpErr := copyFile(p, dst, info.Mode().Perm()); cpErr != nil {
+			return fmt.Errorf("%s: %w", filepath.ToSlash(rel), cpErr)
+		}
+		copied++
+		return nil
+	})
+	return copied, replaced, err
+}
+
+// isWithinRel 判断 filepath.Rel(base, p) 的结果是否表示 p 在 base 内（含相等）。
+func isWithinRel(rel string) bool {
+	return rel == "." || (!filepath.IsAbs(rel) && rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// copyFile 复制单个文件；用 io.Copy 避免把大资源整个读进内存。
+func copyFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // canCleanOutput 判断产物目录是否位于前端工程内部（且不是工程根本身）。
