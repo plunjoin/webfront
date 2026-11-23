@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.7）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.8）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -23,7 +23,9 @@ func New(cfg Config) (*Engine, error)
 | 校验 | `Renderer == nil && EmbedFS == nil` → 返回 error；其余组合都允许 |
 | 存在性 | `fs.Sub` 对 `embed.FS` 是惰性的；`DistDir` 写错或产物为空时通常不会在 `New` 报错，到请求时才 404。自动探测会 `WalkDir("pages")` 并 `Stat("index.html")`，找不到就是没有 |
 
-`Engine` 持有 `Renderer`；`Close()` 会调用 `Renderer.Close()`。不要在一个已关闭的池上继续渲染。
+`Engine` 持有 `Renderer`；`Close()` 会调用 `Renderer.Close()`，并把内部指针置空（可重复调用）。
+`SetRenderer(r)` 原子替换渲染器：在途渲染持读锁继续完成，旧渲染器等它们退出后才关闭；
+替换后新请求立即使用新实例。它只改变“由谁执行 JS”，不会重新解析 `Mode`。
 
 ```go
 eng, _ := webfront.New(cfg)
@@ -202,12 +204,13 @@ mux.Handle("/", eng)                  // 其余走 SSR / 静态
 - 服务的是整个 `dist`（包括 `ssr.js`、`pages/*.html`），子路径挂载时注意暴露面。
 - 调用方不要把 `Config.BasePath` 用 `http.StripPrefix` 再剥一遍；handler 内部已经处理。
 
-### 3.5 `Static() bool` / `Mode() Mode` / `BasePath() string` / `Close() error`
+### 3.5 `Static() bool` / `Mode() Mode` / `BasePath() string` / `Close() error` / `SetRenderer`
 
 - `Static()`：`Renderer == nil` 时为 true。它只表示“没有 JS 渲染器”；自动模式可能把这种 engine 解析成 SPA，判形态请用 `Mode()`。
 - `Mode()`：返回 `New` 解析后的有效模式。`ModeSSR + Static()` = 预渲染/静态；`ModeSSR + !Static()` = 动态 SSR。
 - `BasePath()`：返回归一化后的前缀（挂根时 `""`）。
-- `Close()`：有 Renderer 时调用其 `Close()`；否则返回 nil。
+- `Close()`：有 Renderer 时调用其 `Close()`；否则返回 nil。可重复调用。
+- `SetRenderer(r Renderer) error`：原子替换渲染器并关闭旧实例（`r` 与旧实例相同时不关闭）；传 nil 卸载。在途渲染完成后才会关闭旧池，不会把正在执行的 goja VM 回收掉。不重新解析 `Mode`。
 
 ## 4. URL 与 BasePath 规则
 
@@ -236,10 +239,10 @@ mux.Handle("/", eng)                  // 其余走 SSR / 静态
 最终结构：
 
 ```html
-<!doctype html><html><head>
-  {head}
+<!doctype html><html{HTMLAttrs}><head>
+  {head}{HeadHTML}
   <script id="__WF_DATA__" type="application/json">{propsJSON}</script>
-</head><body>
+</head><body{BodyAttrs}>
   {html}
   <script type="module" src="{clientScript}"></script>
 </body></html>
@@ -250,13 +253,14 @@ mux.Handle("/", eng)                  // 其余走 SSR / 静态
 1. **Title**：`page.Head.Title != ""` 且 `head` 中不含子串 `<title` → 在前面插入 `<title>转义后的标题</title>`。
 2. **Description**：`page.Head.Description != ""` 且 `head` 中不含 `name="description"` / `name='description'` → 追加 `<meta name="description" content="...">`。
 3. **CSS**：`clientFS` 中存在 `assets/client.css`，且 `head` 不含子串 `assets/client.css` → 追加 `<link rel="stylesheet" href="{BasePath}/assets/client.css">`。
-4. **数据**：`json.Marshal(page.Props)` 写入 `__WF_DATA__`。`encoding/json` 默认把 `<`、`>`、`&` 转义成 `\u003c`、`\u003e`、`\u0026`，防止 `</script>` 注入。
-5. **客户端脚本**：`clientScript()` 非空时，用 `strings.Replace` 在第一个 `</body>` 前插入 `<script type="module" src="...">`。
+4. **自定义 head**：`page.HeadHTML` 原样追加到 `head` 末尾（在数据脚本之前），用于 viewport / favicon / robots 等标签。
+5. **数据**：`json.Marshal(page.Props)` 写入 `__WF_DATA__`。`encoding/json` 默认把 `<`、`>`、`&` 转义成 `\u003c`、`\u003e`、`\u0026`，防止 `</script>` 注入。
+6. **客户端脚本**：`clientScript()` 非空时，用 `strings.Replace` 在第一个 `</body>` 前插入 `<script type="module" src="...">`。
 
 补充：
 
 - `assemble` **不添加** `<div id="root">`；hydration 根节点由 `entry-server` 的 `html` 提供。
-- `assemble` 固定输出无属性的 `<html>`，也不添加 charset / viewport meta；需要这两类标签就在 `entry-server` 返回的 `head` 里写。`lang` 是 `<html>` 的属性，当前没有 API 可以设置（只能在外层包装/替换最终 HTML）。
+- `Page.HTMLAttrs` / `BodyAttrs` 原样拼到 `<html>` / `<body>` 开标签（空串不留多余空格），调用方负责转义；`lang="zh-CN"`、`class="..."` 等都由此设置。`HeadHTML` 用于 charset / viewport / favicon 等自定义标签。`assemble` 本身仍不主动添加 charset / viewport。
 - `props` 为 nil → `__WF_DATA__` 内容是 `null`，不是 `{}`。
 - 客户端脚本是 `type="module"`（天然 defer）；无论客户端产物是 ESM 拆分还是单文件 IIFE，都能执行。
 
@@ -454,10 +458,77 @@ portal := dev.Handler("web/portal", func() http.Handler { return webui.PortalHan
 | `WithDefine(map)` | `process.env.NODE_ENV="development"`；Vue 依赖自动补 `__VUE_*__` | 合并进 dev 的所有 esbuild 构建/转译 define，调用方同名项优先 |
 | `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录：文件按 URL 原样返回（`no-cache`，支持 `Last-Modified`/304），目录请求回目录下的 `index.html`，找不到才回 SPA 外壳。相对 root 或绝对路径均可；传空串关闭。根路径永远给 HMR 外壳，`public/index.html` 顶不掉开发入口 |
 | `WithAdapters(adapters...)` | Vue（`adapter/vue` 内置） | 追加框架适配器（`adapter.Adapter`：`Name` / `Extensions` / `SelfAccepts` / `HMRKind`）。扩展名监听、HMR 边界、update kind 与 `connected.capabilities` 统一由注册表驱动；同扩展名后注册者胜出 |
+| `WithSSR(entry, factory)` | 关闭 | `entry` 为项目相对路径，`factory` 通常来自 `dev/ssr.Factory(workers)`。两者必须同时给出，否则 `NewDevServer` 返回 error。启动时同步编译一次，之后每次变更异步重编译并原子换池；编译失败保留上一版 |
+| `WithHTMLShell(fn)` | 默认外壳 | `fn` 为 `dev.ShellFunc`：`func(dev.ShellData) ([]byte, error)`，返回整页骨架。自定义外壳自行决定 title / meta / `<html>` / `<body>` 属性位置 |
+| `WithHTMLShellFile(path)` | 无 | 用磁盘 HTML 文件作骨架（相对 root 或绝对路径）；自动剥离其中指向生产 `client.js` / `client.css` 的标签 |
 
 外置 CJS 依赖里的 `require("react")` 会被改写成顶部静态 `import * as`，不留下浏览器无法执行的 `__require()`。`/@deps/<pkg>/<file>.css`（如 `nprogress/nprogress.css`）返回"导入即注入 `<style>`"的 ESM，而不是当 JS 入口打包。
 
+### 9.6 `DevServer.RenderPage` 与开发态 SSR
+
+`dev.Handler` 适合“所有页面共用一个外壳”的场景。需要按路由给 title / props / SSR
+开关时，保留 `*DevServer` 并自己分派页面请求：
+
+```go
+ds, err := dev.NewDevServer("web/portal",
+    dev.WithSSR("src/entry-server.vue.ts", devssr.Factory(2)),
+    dev.WithHTMLShell(renderShell),
+)
+if err != nil { return err }
+defer ds.Close()
+
+assets := ds.Handler()
+mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    if devAssetPath(r.URL.Path) { // /src/、/@fs/、/@deps/、/@wf/、/__wf_
+        assets.ServeHTTP(w, r)
+        return
+    }
+    ds.RenderPage(w, r, dev.Page{
+        URL:         r.URL.Path,
+        Title:       "作品广场 · Olai",
+        Description: "…",
+        Props:       map[string]any{"locale": "zh-CN"}, // → __WF_DATA__
+        Bootstrap:   map[string]any{"locale": "zh-CN"}, // → __WF_BOOTSTRAP__
+        SSR:         r.URL.Path == "/",
+        HTMLAttrs:   `lang="zh-CN"`,
+        BodyAttrs:   `class="plaza-body"`,
+        HeadHTML:    `<meta name="theme-color" content="#f6f8fc">`,
+    })
+})
+```
+
+`RenderPage` 只接受页面请求；模块、HMR 与 `/@fs` / `/@wf` 资源必须先交给
+`ds.Handler()`。子路径挂载时先剥掉 `WithBasePath` 前缀再判断。
+
+`Page` 字段契约：
+
+| 字段 | 契约 |
+| --- | --- |
+| `URL` | 传给 SSR `render(url, props)` 的 URL；为空时取 `canonicalPath(r.URL.Path)` |
+| `Title` / `Description` | 模板/默认外壳替换对应标签；自定义 `ShellFunc` 通过 `ShellData` 自行使用 |
+| `Props` | SSR 页面写入 `<script id="__WF_DATA__">`，也是传给 SSR 的 props；必须可 JSON 序列化 |
+| `Bootstrap` | 非 nil 时写入 `<script id="__WF_BOOTSTRAP__">`；SPA 页面用它传初始数据 |
+| `SSR` | true 且配置了 `WithSSR` 时先 SSR；未配置 `WithSSR` 返回 500；构建失败（renderer=nil）退回 SPA 外壳 |
+| `HTMLAttrs` / `BodyAttrs` | 属性片段由调用方自行转义；模板/默认外壳追加到 `<html>` / `<body>` |
+| `HeadHTML` | 仅模板/默认外壳自动注入 head；自定义 `ShellFunc` 拿到该字段自行放置 |
+
+- SSR 渲染错误 → `RenderPage` 写 500（响应体是纯文本错误，不写 devui 错误页），并把错误记入 `/__wf_error`。
+- 数据脚本都用 `json.Marshal` 输出，`<` / `>` / `&` 被 Unicode 转义，`</script>` 无法提前闭合。
+- `ShellData.SSR` 表示这次是否成功走了 SSR；`HTML` / `SSRHead` 是已渲染片段；`Request` 是原始请求（只读，不要跨 goroutine 保存）。
+- 骨架可包含 `<!--wf-head-->` / `<!--wf-body-->` / `<!--wf-scripts-->`，服务端原位替换；没有占位符时自动注入 `</head>` / `</body>` 前，并把空的 `<div id="root"></div>` 替换成 SSR 片段。
+- `SSRStatus()` 返回 `{entry, rendererReady, builds, failed, lastError}`；`builds` 只统计成功次数。`Close()` 会等待后台 goroutine 退出并关闭当前渲染池。
+- `dev/ssr.Factory` 在普通构建返回 nil、`-tags dev` 下返回 `jsruntime.Pool` 工厂；因此 SSR 的引擎链接成本只落在真正调用它的 dev 构建。
+
 ## 10. 版本差异
+
+### v0.1.7 → v0.1.8：URL 规范化、CSS 边界与开发态 SSR
+
+- 目录 / index / 文件尾斜杠请求返回 302 到 canonical 模块 URL，query 保留、basePath 保留；`ServeMux` 的 clean-path / 补斜杠重定向也补挂载前缀，透传 `Hijack` / `Flush`。
+- CSS 顶层 `@import` 变成 JS 模块 import（每个 CSS 文件独立 HMR 边界）；条件 `@import` 保留原文并排除出模块图；相对 `url()` 改写成 `/@wf/asset/`。
+- 新增 `dev.WithSSR` / `dev.SSRRenderer` / `dev.SSRRendererFactory` / `dev/ssr.Factory`：开发态 SSR bundle 后台重编译、原子换池、失败保留旧版、恢复整页刷新；`DevServer.SSRStatus()` 暴露状态。
+- 新增 `dev.WithHTMLShell` / `dev.WithHTMLShellFile` / `dev.Page` / `dev.ShellData` / `dev.ShellFunc` / `DevServer.RenderPage`：开发页可按路由定制骨架、title、props 与 SSR 开关。
+- 新增 `webfront.Page.HTMLAttrs` / `BodyAttrs` / `HeadHTML` 与 `Engine.SetRenderer`：生产引擎可直接设置 `<html>` / `<body>` 属性、追加 head 标签，并原子热换渲染器。
+- `jsruntime` shim 增加 no-op `console`，修复 Vue development runtime 在 goja 中 `console is not defined` 的 `ReferenceError`。
 
 ### v0.1.6 → v0.1.7：HMR 协议 v2、模块图与静态资源
 

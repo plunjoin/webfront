@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.7 已实现并验证**（v0.1.6 已发布；v0.1.7 新增 HMR 协议 v2、模块图、静态资源管线、`adapter` 扩展点与 `BuildProfile`）。最后更新：2026-11-23。
+> **状态：v0.1.8 已实现并验证**（v0.1.7 已发布；v0.1.8 新增 dev canonical URL、CSS `@import` 边界、开发态 SSR 热换、`RenderPage` / HTML 外壳 API，以及生产引擎的 `Page` 外壳字段与 `SetRenderer`）。最后更新：2026-11-23。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,7 +10,7 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.7 |
+| 维度 | 草案 v0 | 现状 v0.1.8 |
 | --- | --- | --- |
 | 包结构 | 单包 `pkg` | **按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `module` / `adapter` / `cli` / `cmd/wf`，适配器实现单独成包） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
@@ -234,10 +234,15 @@ Render(w, r, Page)
 
 ```go
 dataJSON, _ := json.Marshal(props)   // 默认把 < > & 转成 \u003c 等，防 </script> 注入
-doc := "<!doctype html><html><head>" + head +
+doc := "<!doctype html><html" + htmlAttrs + "><head>" + head + page.HeadHTML +
     `<script id="__WF_DATA__" type="application/json">` + string(dataJSON) + `</script>` +
-    "</head><body>" + html + "</body></html>"
+    "</head><body" + bodyAttrs + ">" + html + "</body></html>"
 ```
+
+`Page.HTMLAttrs` / `BodyAttrs` / `HeadHTML` 是调用方原样提供的片段，由调用方负责转义；
+`assemble` 只补前导空格，不会二次转义。`Engine.SetRenderer` 允许开发期原子热换
+`Renderer`：渲染在 `rendererMu.RLock()` 内完成，换池持写锁，旧实例在所有在途渲染
+结束、解锁之后才 `Close()`。
 
 客户端脚本统一用 `<script type="module">`：代码分割产物是 ESM，模块脚本天然 defer 不阻塞解析；未拆分的 IIFE 在模块里同样可执行，两种产物共用同一标签。
 
@@ -525,6 +530,11 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 }
 ```
 
+开发态 SSR bundle 带 `NODE_ENV=development`，框架会走 warning 分支并直接调用
+`console.warn` / `console.error`。goja 没有宿主 `console`，Vue 在 `initFeatureFlags`
+阶段就会 `ReferenceError`（生产 define 碰巧把这段裁掉了，所以构建态没暴露）。shim
+提供一组 no-op 方法；生产 bundle 不受影响。
+
 ### 5.4 微任务收口与状态隔离
 
 **统一收口**：React 的 `renderToString` 同步返回对象，Vue 的 `renderToString` 返回 Promise。用同一个脚本把两者都拍平：
@@ -659,7 +669,7 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 | 路由 | 行为 |
 | --- | --- |
-| `GET /` | 返回 HTML 骨架：import map（有别名 / npm 映射时）+ 覆盖层脚本 + 外部 `type=module` boot（应用脚本不内联）；根路径不会被 `public/index.html` 顶掉 |
+| `GET /` | 返回 HTML 骨架：import map（有别名 / npm 映射时）+ 覆盖层脚本 + 外部 `type=module` boot（应用脚本不内联）；根路径不会被 `public/index.html` 顶掉。骨架可由 `WithHTMLShell` / `WithHTMLShellFile` 替换；项目侧也可以用 `DevServer.RenderPage` 按路由传入 title / props / SSR 开关 |
 | `GET /@wf/client` | HMR 运行时单例 ESM（全站只此一份）：`createHotContext`、批次串行队列、重连 |
 | `GET /@wf/boot` | 入口启动脚本：`import(entry)`，成功调 `render()`，失败回读 `/__wf_error` 盖错误层 |
 | `GET /@wf/overlay.js` | `devui` 错误覆盖层（普通脚本，先于 boot 加载） |
@@ -697,11 +707,26 @@ self-accept 边界（Vue / CSS / 用户手写 accept），边界重新执行；�
 构建期由 `BuildProfile` 的 `LoaderFile` 产出带 hash 的资源文件（SSR 用 `LoaderDataURL`
 内联，避免 goja 侧需要资源宿主）。`?raw` 返回文本模块，`?url` 与默认行为一致。
 
+**CSS `@import` 的模块化**：`.css` 先由 esbuild 解析，顶层 `@import` 被改写成 JS
+模块 import，因此每个 CSS 文件都是独立 HMR 边界：改被 import 的文件只替换它自己的
+`<style data-wf-id>`，不会重建整个样式表。带 media / supports 条件的 `@import`
+无法安全拆成模块，保留为 CSS 原文并排除出模块图（其依赖变化不会触发 HMR，属于
+已知边界）。相对 `url()` 一律改写成 `/@wf/asset/...`：CSS 内联成 `<style>` 后，
+浏览器会以页面 URL 为 base 解析，不改写就会去请求 `/src/assets/...` 这样的错误路径。
+
 **扩展名补全**：浏览器不做解析，`import App from './App'` 会原样请求 `/src/App`。构建期由
 esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 自己按
 「原路径 → 路径+`.tsx|.ts|.jsx|.js|.vue|.css|.json` → 路径/`index.*`」补全。
 不补的话，任何带相对导入的工程一进 dev 就 404 —— 而且浏览器只会回一句
 `Failed to fetch dynamically imported module`，看不出是哪个文件。
+
+补全之后必须 **302 到 canonical URL**，而不是在旧 URL 上直接返回内容：模块内部的
+相对 import 与 CSS `url()` 都以请求 URL 为 base，停留在 `/src/lib/i18n` 会让 `./en`
+解析成 `/src/lib/en`；HMR 的 owner URL 也会和真实模块 URL 分叉。canonical 判断用
+**精确路径比较**（不能先 `path.Clean`，否则 `/src/router.ts/` 会被当成已规范化而漏掉
+尾斜杠），重定向保留 query，并在 `WithBasePath` 下带挂载前缀。`ServeMux` 自己产生的
+补斜杠 / clean-path 重定向经过 `basePathLocationWriter`，同样补前缀，同时透传
+`Hijack` / `Flush`，不影响 WebSocket 升级。
 
 **导入别名**：dev 期不做模块解析，`@/` 与 `tsconfig` `paths` 由 `compiler.LoadAliases`
 在启动时读一次（改配置需重启），写进 `index.html` 的 import map。前缀别名保持尾斜杠，
@@ -861,6 +886,91 @@ devui.ErrorPage()     独立错误页（SSR/goja 失败时当响应体整页返�
 改回原文件 → 自动消失；`throw new Error('boom-runtime')` → "运行期错误" + 栈；
 `Promise.reject` → "未处理的 Promise 拒绝"；`import './Broken'`（坏文件）→ 定位到
 `/src/Broken.tsx` 而不是那句 `Failed to fetch`。
+
+### 7.5 开发态 SSR：bundle 重编译与原子热换
+
+浏览器模块可以按模块 HMR，SSR 产物不行：它是一个覆盖整个服务端入口的 bundle，
+goja 把 `render` 函数闭包在已加载的 VM 里。所以开发态 SSR 的粒度是 **bundle**：
+`WithSSR(entry, factory)` 让 DevServer 在后台重编译整份 bundle，再用新 bundle 建
+渲染池、原子替换。`entry` 为空或 `factory` 为 nil 时 `NewDevServer` 直接报错；
+静默退化成 SPA 会让“SSR 没生效”极难发现。
+
+```
+watcher flush ──► kickSSR()（cap=1 channel，连续保存自然合并）
+                        │
+                        ▼
+        compiler.BuildSSRWithOptions(root, entry, modulesDir, profile)
+                        │  失败：保留旧 renderer，广播 error
+                        ▼
+        factory(bundle) → 新 renderer（如 dev/ssr.Factory(2) → jsruntime.Pool）
+                        │
+                        ▼
+        ssrMu.Lock() 换指针 → 解锁后才 Close 旧 renderer
+```
+
+几个关键决定：
+
+1. **首次编译同步完成**。`NewDevServer` 在启动时先 `rebuildSSR(false)`，所以第一个
+   请求就能 SSR；此时还没有浏览器客户端，失败只记状态、不广播。
+2. **失败不拆台**。编译 / factory / 建池任一失败都保留上一版 renderer，页面继续用
+   旧 bundle 渲染；同时记 `ssrHadError` / `ssrLastErr`，并在有客户端时广播
+   `error` update（前台覆盖层可见）。恢复成功后广播 `full-reload`：失败期间退回
+   SPA 的页面需要整页刷新才会重新走服务端渲染。
+3. **换池等在途渲染结束**。渲染持 `ssrMu.RLock()`，替换持写锁；旧池在所有在途
+   `RenderHTML` 返回后才 `Close()`，避免 goja VM 在执行中被回收。`swapSSR` 在写锁
+   内只换指针，`Close` 放到解锁之后，避免慢关闭阻塞新请求。
+4. **开发态也要同一套 define**。`compiler.DevelopmentProfile()` 默认 `ESNext` 是给
+   浏览器 dev 模块的；SSR 最终跑在 goja 里，`Target` 必须覆盖成 `ES2017`。同时
+   `Define` 复用 `buildDefine(rootDeps, userDefine)`，否则 Vue dev runtime 的
+   `__VUE_OPTIONS_API__` 等特性开关缺失，`initFeatureFlags` 会告警甚至
+   `ReferenceError`（goja 的 `console` shim 见 §5.3）。
+5. **引擎仍然可选**。`dev` 核心只认 `SSRRenderer` 接口；`dev/ssr.Factory` 在
+   `-tags dev` 下返回 `jsruntime.New`，普通构建返回 nil。不用 SSR 的项目不会把
+   goja 链进 dev 二进制。
+
+`DevServer.SSRStatus()` 暴露 `{entry, rendererReady, builds, failed, lastError}`，
+供项目侧日志 / 健康检查使用。`Close()` 在 watcher 与后台 goroutine 退出后关闭
+当前渲染池。
+
+### 7.6 HTML 外壳扩展与 `RenderPage`
+
+默认开发外壳只适合“一个前端一个入口”的场景。真实项目通常需要按路由给不同
+title / description / lang / body class，SSR 页面还要用生产同款 props。`dev` 提供
+三层能力，均由 `renderDocument` 收口：
+
+| 输入 | 作用 |
+| --- | --- |
+| 无 | 默认外壳：`<!doctype html><html><head>…</head><body><div id="root"></div>…` |
+| `WithHTMLShellFile(path)` | 读磁盘模板（可相对 root 或绝对路径）；`dist/index.html` 可直接复用 |
+| `WithHTMLShell(fn)` | `ShellFunc(ShellData) ([]byte, error)` 返回整页骨架 |
+| `DevServer.RenderPage(w, r, Page)` | 项目侧按请求传入 URL / title / props / SSR 开关 / 属性 / HeadHTML |
+
+**注入顺序**：`HeadHTML`（仅模板/默认外壳）→ SSR head（Vue 收集的 `<style>`）→
+import map → `__WF_DATA__`（仅 SSR 成功）→ `__WF_BOOTSTRAP__`（`Page.Bootstrap`
+非 nil）→ `</head>` 前；overlay 普通脚本 + `/@wf/boot` module 注入 `</body>` 前。
+`ShellFunc` 拿到同样的字段，由它决定 meta / title / 属性放在哪里；模板与默认外壳
+则由 `applyPageMeta` 自动替换 title / description、追加 `<html>` / `<body>` 属性。
+
+**占位符**：模板里可写 `<!--wf-head-->`、`<!--wf-body-->`、`<!--wf-scripts-->`，
+服务端原位替换。没有占位符时：head 注入 `</head>` 前，脚本注入 `</body>` 前；
+SSR 片段优先替换空的 `<div id="root"></div>`，没有该节点则放到 `<body>` 开头。
+注入内容即使模板缺少 `</head>` / `</body>` 也尽量不丢。
+
+**复用生产骨架**：`stripProdClientAssets` 剥掉 `<script src="...client.js">` 与
+`<link href="...client.js|css">`（正则限定 `client.js` / `client.css`，不误伤其他
+资源），否则 dev 会加载带 hash 的旧产物，出现双份应用或 404。
+
+**数据语义与生产引擎一致**：SSR 页面写 `<script id="__WF_DATA__">`，客户端据此
+`createSSRApp` + hydrate；SPA 页面只写 `__WF_BOOTSTRAP__`，不写 `__WF_DATA__`
+（否则会 hydrate 一个空 root）。两者都用 `json.Marshal` 输出，`<` / `>` / `&`
+被转义成 Unicode 转义序列（小于号、大于号、& 都不会以字面量出现），内容里的
+`</script>` 无法提前闭合。
+
+**错误语义**：`Page.SSR=true` 且配置了 `WithSSR`，但当前 renderer 为 nil（首次 /
+最近一次构建失败）→ 退回 SPA 外壳，不 500；SSR 执行错误 → 500 并记
+`/__wf_error`；`Page.SSR=true` 却没配置 `WithSSR` → 500（配置错误必须显式）。
+`RenderPage` 不经过 `serveIndex`，所以项目侧页面路由必须在 setup 门禁 / API 路由
+之后自行分派——这正是 `dev-only 路由接线` 的做法（见 GUIDE §6.4）。
 
 ---
 

@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.7（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径；v0.1.6 新增免 build tag 的 `dev.Handler`、独立 `dev/supervise` 与 `public/` 静态目录；v0.1.7 将 dev HMR 升级为协议 v2（模块图边界冒泡、批次/prune、说明符版本化），支持 Vue 组件级热替换、静态资源管线、`adapter` 扩展点与 `BuildProfile`。
+> **文档对应 v0.1.8（最新发布版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径；v0.1.6 新增免 build tag 的 `dev.Handler`、独立 `dev/supervise` 与 `public/` 静态目录；v0.1.7 将 dev HMR 升级为协议 v2（模块图边界冒泡、批次/prune、说明符版本化），支持 Vue 组件级热替换、静态资源管线、`adapter` 扩展点与 `BuildProfile`；v0.1.8 新增 dev canonical URL 重定向、CSS `@import` 边界、开发态 SSR 热换、`RenderPage` / HTML 外壳 API，以及生产引擎的 `Page` 外壳字段与 `SetRenderer`。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.7
+go get github.com/plunjoin/webfront@v0.1.8
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.7
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.8
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.7` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.7` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.8` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.8` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -520,6 +520,9 @@ mux.Handle("/admin/", ds.Handler())   // import map / HMR / 广播都会带 /adm
 | `WithDefine(map)` | `NODE_ENV=development`（Vue 项目自动补 `__VUE_*__`） | 合并进 esbuild 的 define，自定义项优先 |
 | `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录；目录请求回其 `index.html`，找不到才回 SPA 外壳。传空串关闭；根路径永远给 HMR 外壳 |
 | `WithAdapters(adapters...)` | Vue（`adapter/vue` 内置） | 追加框架适配器：扩展名监听、self-accept、HMR kind 与 `connected` 能力表由注册表统一驱动；同扩展名后注册者胜出 |
+| `WithSSR(entry, factory)` | 关闭 | 开发态 SSR：按 `entry`（项目相对路径）后台重编译 SSR bundle，成功后原子替换渲染器；`factory` 通常传 `devssr.Factory(2)`（见下） |
+| `WithHTMLShell(fn)` | 默认外壳 | 用 `ShellFunc` 定制开发页骨架（`lang` / body class / title / meta / 自定义脚本占位） |
+| `WithHTMLShellFile(path)` | 无 | 直接复用磁盘上的 HTML 骨架（相对 root 或绝对路径）；`dist/index.html` 里的生产 `client.js` / `client.css` 标签会自动剥离 |
 
 `/@deps` 还支持 CSS 子路径：`import "nprogress/nprogress.css"` 会返回一个
 "导入即注入 `<style>`" 的 ESM 模块，不需要调用方自己处理样式文件。外置的 CJS 依赖
@@ -536,6 +539,83 @@ Vue 边界分两种模式：自己的模板/样式改动走 `rerender` 保留 se
 不会误 prune，首次编译失败的模块修好后也会自动整页恢复。实现细节见
 [ARCHITECTURE.md](ARCHITECTURE.md) §7.2。
 
+**URL 规范化**：浏览器不做扩展名解析，`./router` / `./lib/i18n` 之类的请求会原样到达
+dev server。命中真实文件后返回 **302** 到 canonical URL（`/src/router` →
+`/src/router.ts`，`/src/lib/i18n` → `/src/lib/i18n/index.ts`，文件后的多余尾斜杠也会去掉），
+query 原样保留，挂了 `WithBasePath` 时目标同样带前缀。这样模块内部的相对 import、
+CSS `url()` 与 HMR 的 owner URL 都以真实文件为 base；不规范 URL 不会进模块图。
+`ServeMux` 自己产生的补斜杠 / clean-path 重定向也会由挂载层补上前缀。
+
+**CSS `@import` 与 `url()`**：dev 下 `.css` 由 esbuild 解析后包成 ESM。顶层 `@import`
+会变成 JS 模块 import，每个 CSS 文件因此是独立的 HMR 边界；带 media / supports 条件的
+`@import` 保留为 CSS 原文，不参与模块图。相对 `url()` 改写成 `/@wf/asset/...`，图片、
+字体改动同样能触发 HMR，而不会因为 CSS 从 `/src/` 移到内联 `<style>` 后解析到错误目录。
+
+### 开发态 SSR 与 HTML 外壳
+
+开发态可以和服务端一样跑 SSR，只是 bundle 的换法不同：模块能按 HMR 替换，整份 SSR
+bundle 不能，所以 DevServer 在后台重编译 → 建新渲染池 → 原子替换。在途渲染持读锁，
+换池等它们结束后才关闭旧池，不会把正在执行的 goja VM 回收掉。
+
+```go
+import (
+    "github.com/plunjoin/webfront/dev"
+    devssr "github.com/plunjoin/webfront/dev/ssr"
+)
+
+// 只有 -tags dev 构建会链接 jsruntime；生产构建里 Factory 返回 nil。
+ds, err := dev.NewDevServer("web/portal",
+    dev.WithSSR("src/entry-server.vue.ts", devssr.Factory(2)),
+    dev.WithHTMLShell(func(data dev.ShellData) ([]byte, error) {
+        // 自定义骨架：marker 会被原位替换，没有 marker 时自动注入 </head> / </body> 前。
+        return renderShell(data) // 可用 data.SSR / data.HTML / data.SSRHead / data.Title ...
+    }),
+)
+if err != nil { log.Fatal(err) }
+defer ds.Close()
+
+// 模块 / HMR / 资源请求由 DevServer 自己处理；页面请求才交给 RenderPage。
+assets := ds.Handler()
+mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    if devAssetPath(r.URL.Path) { // /src/、/@fs/、/@deps/、/@wf/、/__wf_
+        assets.ServeHTTP(w, r)
+        return
+    }
+    ds.RenderPage(w, r, dev.Page{
+        URL:       r.URL.Path,
+        Title:     pageTitle(r.URL.Path),
+        Props:     pageProps(r),              // SSR 页面 → __WF_DATA__
+        Bootstrap: shellBootstrap(r),         // SPA 页面 → __WF_BOOTSTRAP__
+        SSR:       r.URL.Path == "/",
+        BodyAttrs: `class="plaza-body"`,
+        HTMLAttrs: `lang="zh-CN"`,
+    })
+})
+```
+
+- 不要把**所有**请求都交给 `RenderPage`：`/src`、`/@wf`、`/__wf_hmr` 必须先走
+  `ds.Handler()`，否则页面渲染会截走模块与 HMR。项目里通常把这段判断放在 setup
+  门禁之前，完整接线见 [GUIDE §6.4](docs/GUIDE.md)。
+- 多个前端各建一个 DevServer；admin 这类子路径前端传 `WithBasePath("/admin")`，
+  内部路由前缀判断也要先剥掉挂载前缀。
+- `WithSSR` 的 `entry` 是项目相对路径；`entry` 与 `factory` 必须同时给出，否则
+  `NewDevServer` 直接报错——静默退化成 SPA 会让“SSR 没生效”很难发现。
+- 首次编译是同步的（启动后第一次请求就能 SSR）；之后每次源码变更异步重编译，成功后
+  新请求立即用新 bundle。编译失败保留上一版渲染器，同时向浏览器广播 `error`；恢复后
+  广播 `full-reload`，页面重新走服务端渲染。`ds.SSRStatus()` 可读 `RendererReady` /
+  `Builds` / `Failed` / `LastError`。
+- `Page.SSR=true` 但构建失败（renderer 为 nil）时退回 SPA 外壳，不 500；显式标记 SSR
+  却没配置 `WithSSR` 才返回 500。SSR 执行错误会返回 500，并记进 `/__wf_error`。
+- 数据语义与生产引擎一致：SSR 页面写 `__WF_DATA__`（hydration 用），SPA 页面只写
+  `__WF_BOOTSTRAP__`；两者都做 `<` / `>` / `&` 转义，`</script>` 无法提前闭合。
+- 开发 SSR 同样使用 Vue 特性开关 define，和浏览器 dev 模块保持一致；`dev/ssr.Factory`
+  会让 dev 构建额外链接 goja（约 +9.5MB），不用 SSR 的工程不受影响。
+
+`WithHTMLShellFile("dist/index.html")` 可直接复用生产骨架：开发服务器剥掉
+`client.js` / `client.css` 标签，再注入 import map、overlay、boot 与 SSR 结果。
+自定义 `ShellFunc` 拿到 title / description / attrs / HeadHTML，由它自己决定放在哪里；
+模板与默认外壳则由服务端自动补 `<html lang>`、`<body class>`、title 与 description。
+
 ---
 
 ## 构建标签
@@ -549,6 +629,9 @@ Vue 边界分两种模式：自己的模板/样式改动走 `rerender` 保留 se
 `dev.Handler` 在普通构建里原样返回 fallback，所以接线代码可以只有一份；esbuild / fsnotify /
 websocket 不会因为 import `dev` 就进生产二进制。`go build ./...` 不会碰示例目录
 （`_examples` 前缀被 Go 工具链跳过），所以库本身永远能干净编译。
+
+用了 `dev.WithSSR` + `devssr.Factory` 的 dev 构建还会链接 `jsruntime`（goja，约 +9.5MB）；
+没有调用 Factory 的模块不会被链接。`dev/ssr` 在普通构建里返回 nil，生产二进制仍为零引擎。
 
 ---
 
@@ -662,7 +745,7 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.7 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.8 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
@@ -670,6 +753,16 @@ v0.1.7 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_
 - 客户端 258KB → 45KB（gzip），二次访问 304
 - Vue 嵌套组件模板热替换保留 setup 状态、脚本改动重建实例、无边界模块整页刷新（Chromium 实测）
 - HMR 协议 v2 的边界/批次/prune/未知消息用例由 Go + goja 测试覆盖，生产产物零 HMR 符号
+- canonical URL / CSS `@import` / 开发态 SSR / HTML 外壳均有 Go 测试覆盖，示例工程的默认 / `dynamic` / `dev` 三种构建全部通过
+
+### v0.1.8 相对 v0.1.7
+
+- **dev URL 规范化**：无扩展名 / 目录 / index / 文件尾斜杠请求命中真实文件后返回 **302** 到 canonical URL（`/src/router` → `/src/router.ts`、`/src/lib/i18n` → `/src/lib/i18n/index.ts`），query 与 `WithBasePath` 前缀保留；`ServeMux` 的 clean-path / 补斜杠重定向也由挂载层补前缀。模块内相对 import、CSS `url()` 与 HMR owner URL 从此都稳定以真实文件为 base
+- **CSS 模块边界**：dev 顶层 `@import` 改写成 JS 模块 import，每个 CSS 文件独立 self-accept；带 media / supports 的条件 `@import` 保留 CSS 语义并移出模块图；相对 `url()` 改写成 `/@wf/asset/...`，图片 / 字体改动可触发 HMR 且不会被解析到错误目录
+- **开发态 SSR**：新增 `dev.WithSSR(entry, factory)`、`dev/ssr.Factory` 与 `DevServer.SSRStatus()`。启动时同步编译一次，之后后台重编译并原子换池；编译失败保留上一版 renderer，恢复后整页刷新。在途渲染持读锁，旧池不会在请求中途被关闭
+- **开发页外壳**：新增 `dev.WithHTMLShell`、`dev.WithHTMLShellFile`、`DevServer.RenderPage` 与 `dev.Page` / `ShellData` / `ShellFunc`，可按路由设置 title、description、props、SSR 开关、`<html>` / `<body>` 属性与自定义 head；`dist/index.html` 里的生产 `client.js` / `client.css` 标签会自动剥离
+- **生产引擎外壳扩展**：`webfront.Page` 新增 `HTMLAttrs` / `BodyAttrs` / `HeadHTML`，`Engine` 新增 `SetRenderer`（原子热换渲染器，等在途渲染结束后关闭旧实例）
+- **goja 兼容**：`jsruntime` 增加 no-op `console` shim，修复 Vue development runtime 在开发态 SSR 中因 `console is not defined` 抛 `ReferenceError`
 
 ### v0.1.7 相对 v0.1.6
 

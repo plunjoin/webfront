@@ -4,7 +4,7 @@
 > 每个方法写不写响应、返回什么状态码、缓存头是什么，见 [API 契约](API.md)。
 > 遇到报错直接跳到 [§10 排错](#10-排错按现象查)。
 
-> **本文对应 v0.1.7**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项；v0.1.6 新增免 build tag 的 `dev.Handler` 与 `public/` 静态目录；v0.1.7 将 HMR 升级为模块图驱动的协议 v2，支持 Vue 组件级热替换、静态资源与 `WithAdapters`。
+> **本文对应 v0.1.8**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项；v0.1.6 新增免 build tag 的 `dev.Handler` 与 `public/` 静态目录；v0.1.7 将 HMR 升级为模块图驱动的协议 v2，支持 Vue 组件级热替换、静态资源与 `WithAdapters`；v0.1.8 新增开发态 canonical URL 重定向、CSS `@import` 边界、开发态 SSR 热换与 HTML 外壳 API（§6.1、§6.4）。
 
 ## 先看这个：React/Vue 当 Go 的模板引擎
 
@@ -732,6 +732,53 @@ var distFS embed.FS
 默认构建虽然 import `dev`，但只编译 `Handler` 与选项；生产二进制里仍然没有
 esbuild / fsnotify / websocket。
 
+#### 开发态 SSR 与自定义外壳
+
+纯 SPA 前端用 `dev.Handler` 就够了；如果生产是动态 SSR，开发态也可以跑同一份
+`entry-server`，并让页面标题 / props / `<html lang>` / body class 与生产一致。
+这时需要直接持有 `*DevServer`（`RenderPage` 不在 handler 接口上），通常把它放在
+`//go:build dev` 的接线文件里，生产文件里返回 nil：
+
+```go
+// frontend_mode_dev.go（-tags dev）
+func attachDev(app *server.Server) error {
+    ds, err := dev.NewDevServer("web/portal",
+        dev.WithSSR("src/entry-server.vue.ts", devssr.Factory(2)),
+        dev.WithHTMLShell(renderDevShell), // 可选：返回自己的骨架
+    )
+    if err != nil { return err }
+    app.AttachDevPortal(ds) // 项目侧保存 ds.Handler() 与 ds.RenderPage
+    return nil
+}
+```
+
+```go
+// 页面处理：SSR 页面与 SPA 页面共用同一个 DevServer
+func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
+    s.portal.RenderPage(w, r, dev.Page{
+        URL:         r.URL.Path,
+        Title:       pageTitle(r.URL.Path),
+        Props:       pageProps(r),
+        Bootstrap:   shellBootstrap(r),
+        SSR:         portalSSRPath(r.URL.Path), // 只对 /、/gallery、/download 开 SSR
+        HTMLAttrs:   `lang="zh-CN"`,
+        BodyAttrs:   `class="plaza-body"`,
+        HeadHTML:    devHeadHTML(false),
+    })
+}
+```
+
+- `Props` 只给 SSR 页面（写 `__WF_DATA__`）；`Bootstrap` 给 SPA 外壳（写
+  `__WF_BOOTSTRAP__`）。两者都传也没问题，客户端按 `__WF_DATA__` 是否存在决定
+  `createSSRApp` 还是 `createApp`。
+- `WithHTMLShell` 的 `ShellFunc` 完全接管骨架；marker `<!--wf-head-->` /
+  `<!--wf-body-->` / `<!--wf-scripts-->` 可选，不写就自动注入 `</head>` /
+  `</body>` 前并替换空的 `#root`。
+- `devssr` 是 `github.com/plunjoin/webfront/dev/ssr` 的别名。它只在 `-tags dev` 下
+  链接 `jsruntime`；没有 SSR 的前端不要调用 `Factory`。
+- 首次编译是同步的，所以启动后的第一个请求就能 SSR；之后改源码会在后台重编译并
+  原子换池。`ds.SSRStatus()` 可以接进启动日志 / 健康检查。
+
 ### 6.2 `wf dev` 帮你做 Go 热重启
 
 ```bash
@@ -774,6 +821,61 @@ go build -tags dev .
 - SSR / goja 渲染失败（仅 `WF_DEV=1` 或 `Config.Dev = true` 时）。
 
 生产态 SSR 失败只回干净的 500，不泄露栈。
+
+### 6.4 接入已有 SSR 项目：只把开发内部路由交给 DevServer
+
+已有项目通常把页面、`/api`、登录、安装向导与 `public/` 都握在 Go 手里。不要用一个
+`mux.Handle("/", devHandler)` 把整站交给 DevServer——那会跳过鉴权、setup 门禁和
+业务路由。正确做法是：**只把 DevServer 自己拥有的无扩展名资源交给它，页面仍走
+Go 的 handler，在页面 handler 里调用 `RenderPage`**。
+
+```go
+// 1) 先于 setup 门禁：/src、/@wf、/__wf_hmr 这类路径没有扩展名，
+//    否则首装阶段会被 302 到 /setup，开发外壳永远起不来。
+var devInternalPrefixes = []string{"/src/", "/@fs/", "/@deps/", "/@wf/", "/__wf_"}
+
+func (s *Server) Handler() http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if s.serveDevInternal(w, r) { // portal 或 admin 的 DevServer
+            return
+        }
+        if s.setupNeeded(ctx) && !setupAllowedPath(r.URL.Path) {
+            // 原有 setup 门禁
+        }
+        if strings.HasPrefix(r.URL.Path, "/api/") {
+            s.mux.ServeHTTP(w, r) // API 始终留在 Go
+            return
+        }
+        s.handlePage(w, r) // 页面 handler 内再决定 SSR/SPA 并调用 RenderPage
+    })
+}
+```
+
+- **两个前端各一个 DevServer**：portal 挂根路径；admin 挂运行时 `ADMIN_PATH`
+  （`dev.WithBasePath(adminBase)`）。`serveDevInternal` 先匹配 admin 前缀，再匹配
+  根路径前缀；`/admin/src/...` 归 admin，`/src/...` 归 portal，`/api/...` 谁都不碰。
+- **前缀判断要折叠重复斜杠**：`/admin//src/main.ts` 也要交给 admin DevServer，由它
+  用带 `/admin` 前缀的 302 规范化；否则会落到 Go 的静态 404。
+- **页面路由复用生产分派**：哪些路径 SSR、哪些是 SPA，保持与生产一致
+  （`portalSSRPath` 之类）。SSR 页面传 `Props + SSR:true`；SPA 页面传 `Bootstrap`。
+- **API 不需要网络代理**。DevServer 与应用在同一个进程、同一个端口，`/api` 请求
+  根本不经过 DevServer，浏览器也不存在跨端口请求，所以不需要 Vite 那种
+  `server.proxy`。只有把前端单独跑在另一个进程 / 端口时才需要代理；本方案刻意
+  避开了这一层。
+- **同源校验**：如果应用用 `SITE_ORIGIN` / Referer 做 CSRF 防护，开发端口一变，
+  安装时写进数据库的公开地址就会让校验失败。推荐在 dev 构建里让设置层忽略
+  `SITE_ORIGIN`（例如 `//go:build dev` 的 `IgnoreSiteOrigin()`，只在内存里置位、
+  不写库），让 `RequestOrigin` 回退到请求 Host；生产构建仍读取配置值。否则
+  `/api/gallery` 之类的 GET 会得到 `403 MEDIA_ORIGIN`——页面源码没问题，是
+  origin 校验在拦截。不想改代码时，也可以在后台把 `SITE_ORIGIN` 改成当前开发
+  地址，或让 setup 表单留空 / 填当前开发地址。
+- **本地联调 webfront 本身**：在 `webfront` 与业务项目共同的父目录放一个
+  `go.work`（`use (./webfront, ./app)`），dev 构建就会用本地 webfront；业务项目的
+  `go.mod` 仍固定发布版本，生产 / CI 不读 `go.work`，不会把未发布代码带上线。
+
+> 这套接线的验收点：`/src` 请求有 302 与真实 ESM、Vue 组件 / CSS 改动走 HMR、
+> 页面 HTML 的 title / `lang` / body class 与生产一致、`/api` 请求仍由 Go 返回、
+> 登录与 setup 流程完全不受影响。
 
 ---
 
@@ -927,6 +1029,11 @@ SSR 不是“把 Go 的 session 塞进前端”——`Props` 必须是可 JSON �
 | SSR 报语法错误 `async function*` / `Intl` | goja 不支持部分 ES 特性 | 避免这些语法；SSR 产物已降到 ES2017 |
 | Gin `NoRoute` 返回内容正确但状态码 404 | 自己包了一层处理器，没覆盖预设状态 | 命中后显式 `WriteHeader(200)`；直接用 `gin.WrapH(eng)` 时引擎已处理 |
 | 改 `.go` 后 `wf dev` 没重启 | `rootDir` 指错 / `-watch` 指错 / 改的是 `_test.go` | 在 `main.go` 所在目录跑；`_test.go` 被有意忽略 |
+| 开发页能开，但 `/src/main.ts` 被 302 到 `/setup` 或回 HTML | dev 内部路由接在 setup 门禁之后 | `/src/`、`/@fs/`、`/@deps/`、`/@wf/`、`/__wf_` 必须在 setup 门禁前分派给 DevServer，见 §6.4 |
+| `/admin/src/...` 404，或模块 URL 少了 `/admin` 前缀 | admin 没传 `WithBasePath(ADMIN_PATH)` / 前缀判断没剥挂载前缀 | 用运行时 `ADMIN_PATH` 建 DevServer，并按同前缀分派；重复斜杠先折叠 |
+| 开发态 `/api/...` 返回 403 `MEDIA_ORIGIN` | 数据库里的 `SITE_ORIGIN` 是另一个端口，Referer / Origin 不匹配 | dev 构建里忽略 `SITE_ORIGIN`（`IgnoreSiteOrigin()`，回退请求 Host）；否则在后台改成当前开发地址 |
+| 开发态 SSR 页面报 hydration mismatch | 随机 id 让两端不一致；或 `Teleport` 在服务端不输出子节点而客户端会输出 | id 改用确定性的 `useId()`；给 `Teleport` 加与服务端一致的 `v-if`，按需挂载；这是组件问题，生产 SSR 同样存在 |
+| `DevServer.SSRStatus()` 一直 `rendererReady:false` | SSR bundle 编译失败 / `entry` 路径错 / 没配 `WithSSR` | 看终端 `[SSR] build failed` 或 `lastError`；`entry` 相对前端 root，且 factory 必须非 nil |
 | 共享 `wf_modules` 后某个前端解析不到包 | 最后一次 `install` 覆盖了 `manifest.json` | 每个前端独立依赖目录，或合并成一个 lockfile 只 install 一次 |
 | 删掉某条路由后旧页面还在 | `wf build` 只清理固定产物（`ssr.js` / `pages/` 等），不清理旧 chunk / 自定义文件 | 发布构建前 `rm -rf web/dist`，或先清空产物目录 |
 
@@ -947,3 +1054,7 @@ SSR 不是“把 Go 的 session 塞进前端”——`Props` 必须是可 JSON �
 - [ ] 生产构建没有 import `jsruntime` / `compiler`（除非确实要动态 SSR）；`dev` 可以 import，重依赖都带 `//go:build dev`
 - [ ] 每个前端的依赖目录独立，或共享目录只由一个 lockfile 驱动
 - [ ] 发布构建清空了 `dist/`，没有残留旧路由 / 旧 chunk（`wf build` 会清理它自己的固定产物）
+- [ ] dev 内部路由（`/src/`、`/@fs/`、`/@deps/`、`/@wf/`、`/__wf_`）先于 setup 门禁 / 鉴权分派
+- [ ] admin 的 DevServer `WithBasePath` 与运行时 `ADMIN_PATH` 一致，模块前缀判断先剥挂载前缀
+- [ ] 使用开发态 SSR 时 entry 与 factory 同时配置，`SSRStatus().RendererReady` 为 true
+- [ ] dev 构建忽略数据库里的 `SITE_ORIGIN`（回退请求 Host），换端口不会被同源校验误伤
