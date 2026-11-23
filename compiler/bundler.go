@@ -70,10 +70,24 @@ func BuildSSR(rootDir, entry string) ([]byte, error) {
 
 // BuildSSRWith 同 BuildSSR，但可指定依赖目录名（默认 node_modules）。
 func BuildSSRWith(rootDir, entry, modulesDir string) ([]byte, error) {
+	return BuildSSRWithOptions(rootDir, entry, modulesDir, ProductionProfile())
+}
+
+// BuildSSRWithOptions 用显式 BuildProfile 构建 SSR bundle。
+//
+// 与旧接口相比，它总是设置 Outdir（Write:false，不落盘）：入口 import CSS
+// 时 esbuild 会同时产出 JS 与 CSS，没有输出目录会直接报错。调用方拿到的是
+// JS 产物，CSS 由 SSR 侧自己的样式收集逻辑处理。
+func BuildSSRWithOptions(rootDir, entry, modulesDir string, profile BuildProfile) ([]byte, error) {
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
 		return nil, err
 	}
+	p := profile.resolve("production", api.ES2017)
+	// NODE_ENV=production 只有经过语法折叠才能删掉 Vue runtime 里的
+	// `if (NODE_ENV !== "production")` 分支（HMR runtime 就在里面）。
+	// SSR 不做空白/标识符压缩，只开启语法级 dead-code elimination。
+	syntax := p.Minify || p.Mode == "production"
 	res := api.Build(api.BuildOptions{
 		Bundle:        true,
 		Write:         false,
@@ -82,20 +96,34 @@ func BuildSSRWith(rootDir, entry, modulesDir string) ([]byte, error) {
 		Platform:      api.PlatformBrowser,
 		EntryPoints:   []string{entry},
 		AbsWorkingDir: abs,
+		Outdir:        "wf-ssr",
 		TsconfigRaw:   tsconfigRaw(abs),
 		NodePaths:     modulesNodePaths(rootDir, modulesDir),
 		Plugins:       buildPlugins(rootDir, modulesDir),
-		Define:        map[string]string{"process.env.NODE_ENV": "\"production\""},
+		Define:        p.Define,
 		// SSR 产物跑在我们的 JS 引擎里，不是浏览器：统一降级到 ES2017，
 		// 让 async generator / 逻辑赋值等新语法由 esbuild 编译掉，
 		// 引擎（尤其 goja）就不用追新语法。客户端产物不降级。
-		Target:   api.ES2017,
-		LogLevel: api.LogLevelSilent,
+		Target:          p.Target,
+		Sourcemap:       p.sourceMap(),
+		MinifySyntax:    syntax,
+		Loader:          p.loaderMap(true),
+		PublicPath:      p.PublicPath,
+		Conditions:      p.Conditions,
+		JSX:             p.JSX,
+		JSXFactory:      p.JSXFactory,
+		JSXFragment:     p.JSXFragment,
+		JSXImportSource: p.JSXImportSource,
+		LogLevel:        api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
 		return nil, fmt.Errorf("esbuild SSR build:\n%s", FormatMessages(res.Errors))
 	}
-	return res.OutputFiles[0].Contents, nil
+	out := firstJSOutput(res.OutputFiles)
+	if out == nil {
+		return nil, fmt.Errorf("esbuild SSR build: no JavaScript output")
+	}
+	return out, nil
 }
 
 // BuildClient bundles the client entry (hydration bootstrap) to an IIFE that
@@ -108,9 +136,49 @@ func BuildClient(rootDir, entry, outfile string) ([]byte, error) {
 // 客户端产物直接进浏览器，故默认开启压缩（whitespace+identifiers+syntax）：
 // React 18 未压缩 252KB → 压缩后 139KB；再叠加 StaticHandler 的 gzip 后线上约 45KB。
 func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error) {
+	p := ProductionProfile()
+	p.Minify = true
+	return BuildClientWithOptions(rootDir, entry, outfile, modulesDir, p)
+}
+
+// BuildClientWithOptions 用显式 BuildProfile 构建单文件客户端 bundle，
+// 只返回 JS 产物。需要同时拿到入口 import 的 CSS / 静态资源时用
+// BuildClientFilesWithOptions。
+func BuildClientWithOptions(rootDir, entry, outfile, modulesDir string, profile BuildProfile) ([]byte, error) {
+	files, err := BuildClientFilesWithOptions(rootDir, entry, outfile, modulesDir, profile)
+	if err != nil {
+		return nil, err
+	}
+	out := firstJSOutput(files)
+	if out == nil {
+		return nil, fmt.Errorf("esbuild client build: no JavaScript output")
+	}
+	return out, nil
+}
+
+// BuildClientFiles 与 BuildClientWith 使用相同的生产方式，但返回全部产物，
+// 让 CLI 能把入口 import 的 CSS 与静态资源一起落盘。
+func BuildClientFiles(rootDir, entry, outfile, modulesDir string) ([]api.OutputFile, error) {
+	p := ProductionProfile()
+	p.Minify = true
+	return BuildClientFilesWithOptions(rootDir, entry, outfile, modulesDir, p)
+}
+
+// BuildClientFilesWithOptions 返回客户端入口的全部产物（JS、CSS、静态资源）。
+// outfile 决定入口产物的目录与文件名；其它产物由 esbuild 的命名规则生成。
+func BuildClientFilesWithOptions(rootDir, entry, outfile, modulesDir string, profile BuildProfile) ([]api.OutputFile, error) {
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
 		return nil, err
+	}
+	p := profile.resolve("production", api.ESNext)
+	outdir := filepath.Dir(outfile)
+	if outdir == "" {
+		outdir = "."
+	}
+	wantBase := strings.TrimSuffix(filepath.Base(outfile), filepath.Ext(outfile))
+	if wantBase == "" || wantBase == "." {
+		wantBase = "client"
 	}
 	res := api.Build(api.BuildOptions{
 		Bundle:            true,
@@ -119,20 +187,41 @@ func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error)
 		Platform:          api.PlatformBrowser,
 		EntryPoints:       []string{entry},
 		AbsWorkingDir:     abs,
-		Outfile:           outfile,
+		Outdir:            outdir,
+		EntryNames:        "[name]",
+		AssetNames:        "[name]-[hash]",
 		TsconfigRaw:       tsconfigRaw(abs),
 		NodePaths:         modulesNodePaths(rootDir, modulesDir),
 		Plugins:           buildPlugins(rootDir, modulesDir),
-		Define:            map[string]string{"process.env.NODE_ENV": "\"production\""},
-		MinifyWhitespace:  true,
-		MinifyIdentifiers: true,
-		MinifySyntax:      true,
+		Define:            p.Define,
+		Target:            p.Target,
+		Sourcemap:         p.sourceMap(),
+		Loader:            p.loaderMap(false),
+		PublicPath:        p.PublicPath,
+		Conditions:        p.Conditions,
+		JSX:               p.JSX,
+		JSXFactory:        p.JSXFactory,
+		JSXFragment:       p.JSXFragment,
+		JSXImportSource:   p.JSXImportSource,
+		MinifyWhitespace:  p.Minify,
+		MinifyIdentifiers: p.Minify,
+		MinifySyntax:      p.Minify,
 		LogLevel:          api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
 		return nil, fmt.Errorf("esbuild client build:\n%s", FormatMessages(res.Errors))
 	}
-	return res.OutputFiles[0].Contents, nil
+	// 入口产物统一改名：entry-client.js -> client.js、entry-client.css -> client.css。
+	// esbuild 的 EntryNames 总会在模式后追加输出扩展名，所以不能直接写 "client.js"。
+	entryBase := strings.TrimSuffix(filepath.Base(entry), filepath.Ext(entry))
+	for i := range res.OutputFiles {
+		base := filepath.Base(res.OutputFiles[i].Path)
+		ext := filepath.Ext(base)
+		if strings.TrimSuffix(base, ext) == entryBase {
+			res.OutputFiles[i].Path = filepath.Join(filepath.Dir(res.OutputFiles[i].Path), wantBase+ext)
+		}
+	}
+	return res.OutputFiles, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -150,11 +239,19 @@ func BuildClientWith(rootDir, entry, outfile, modulesDir string) ([]byte, error)
 // BuildClientSplit 产出多个文件：入口 client.js + chunks/<name>-<hash>.js。
 // outDir 为相对 AbsWorkingDir 的输出目录（如 "dist/assets"）。
 func BuildClientSplit(rootDir, entry, outDir, modulesDir string) ([]api.OutputFile, error) {
+	p := ProductionProfile()
+	p.Minify = true
+	return BuildClientSplitWithOptions(rootDir, entry, outDir, modulesDir, p)
+}
+
+// BuildClientSplitWithOptions 同 BuildClientSplit，但用显式 BuildProfile。
+func BuildClientSplitWithOptions(rootDir, entry, outDir, modulesDir string, profile BuildProfile) ([]api.OutputFile, error) {
 	abs, err := filepath.Abs(rootDir)
 	if err != nil {
 		return nil, err
 	}
-	vendor := clientUsedPackages(abs, entry, modulesDir)
+	p := profile.resolve("production", api.ESNext)
+	vendor := clientUsedPackages(abs, entry, modulesDir, p)
 	// 只保留"根依赖"：传递依赖（如 scheduler）会被 react-dom 自己带进来，
 	// 写进虚拟入口反而会因不在 manifest.Root 里而解析失败。
 	vendor = filterRootDeps(abs, modulesDir, vendor)
@@ -179,10 +276,19 @@ func BuildClientSplit(rootDir, entry, outDir, modulesDir string) ([]api.OutputFi
 		AssetNames:        "assets/[name]-[hash]",
 		NodePaths:         modulesNodePaths(rootDir, modulesDir),
 		Plugins:           plugins,
-		Define:            map[string]string{"process.env.NODE_ENV": "\"production\""},
-		MinifyWhitespace:  true,
-		MinifyIdentifiers: true,
-		MinifySyntax:      true,
+		Define:            p.Define,
+		Target:            p.Target,
+		Sourcemap:         p.sourceMap(),
+		Loader:            p.loaderMap(false),
+		PublicPath:        p.PublicPath,
+		Conditions:        p.Conditions,
+		JSX:               p.JSX,
+		JSXFactory:        p.JSXFactory,
+		JSXFragment:       p.JSXFragment,
+		JSXImportSource:   p.JSXImportSource,
+		MinifyWhitespace:  p.Minify,
+		MinifyIdentifiers: p.Minify,
+		MinifySyntax:      p.Minify,
 		LogLevel:          api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
@@ -245,7 +351,7 @@ func filterRootDeps(abs, modulesDir string, pkgs []string) []string {
 }
 
 // clientUsedPackages 用一次普通构建 + metafile 反推"客户端真实用到的包名"。
-func clientUsedPackages(abs, entry, modulesDir string) []string {
+func clientUsedPackages(abs, entry, modulesDir string, p BuildProfile) []string {
 	res := api.Build(api.BuildOptions{
 		Bundle:        true,
 		Write:         false,
@@ -255,13 +361,20 @@ func clientUsedPackages(abs, entry, modulesDir string) []string {
 		AbsWorkingDir: abs,
 		// 入口若 import 了 CSS，一次构建会有 JS+CSS 两个输出，esbuild 要求显式
 		// outdir/outfile 才肯出多文件（Write:false 不落盘，这里只是占位）。
-		Outdir:      "wf-probe",
-		TsconfigRaw: tsconfigRaw(abs),
-		NodePaths:   modulesNodePaths(abs, modulesDir),
-		Plugins:     buildPlugins(abs, modulesDir),
-		Define:      map[string]string{"process.env.NODE_ENV": "\"production\""},
-		Metafile:    true,
-		LogLevel:    api.LogLevelSilent,
+		Outdir:          "wf-probe",
+		TsconfigRaw:     tsconfigRaw(abs),
+		NodePaths:       modulesNodePaths(abs, modulesDir),
+		Plugins:         buildPlugins(abs, modulesDir),
+		Define:          p.Define,
+		Target:          p.Target,
+		Loader:          p.loaderMap(false),
+		Conditions:      p.Conditions,
+		JSX:             p.JSX,
+		JSXFactory:      p.JSXFactory,
+		JSXFragment:     p.JSXFragment,
+		JSXImportSource: p.JSXImportSource,
+		Metafile:        true,
+		LogLevel:        api.LogLevelSilent,
 	})
 	if len(res.Errors) > 0 {
 		return nil // 探路失败就退化成"不拆 vendor"

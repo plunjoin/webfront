@@ -284,16 +284,24 @@ func runBuild(root, modulesFlag string, split bool, prerenderFlag, base, out, mo
 			fmt.Printf("✅ Client chunk -> %s/%s (%d bytes)\n", filepath.ToSlash(distDir), filepath.ToSlash(rel), len(f.Contents))
 		}
 	} else {
-		client, err := compiler.BuildClientWith(webDir, clientEntry, filepath.Join(relAssets, "client.js"), modules)
+		files, err := compiler.BuildClientFiles(webDir, clientEntry, filepath.Join(relAssets, "client.js"), modules)
 		if err != nil {
 			fmt.Println("✗ client build error:", err)
 			return 1
 		}
-		if err := os.WriteFile(filepath.Join(distDir, "assets", "client.js"), client, 0o644); err != nil {
-			fmt.Println("✗ write client.js:", err)
-			return 1
+		absDist, _ := filepath.Abs(distDir)
+		for _, f := range files {
+			if err := os.MkdirAll(filepath.Dir(f.Path), 0o755); err != nil {
+				fmt.Println("✗ mkdir:", err)
+				return 1
+			}
+			if err := os.WriteFile(f.Path, f.Contents, 0o644); err != nil {
+				fmt.Println("✗ write:", f.Path, err)
+				return 1
+			}
+			rel, _ := filepath.Rel(absDist, f.Path)
+			fmt.Printf("✅ Client file -> %s/%s (%d bytes)\n", filepath.ToSlash(distDir), filepath.ToSlash(rel), len(f.Contents))
 		}
-		fmt.Printf("✅ Client bundle -> %s/assets/client.js (%d bytes)\n", filepath.ToSlash(distDir), len(client))
 	}
 
 	// 3) index.html（SPA 回退 / 生产托管用）

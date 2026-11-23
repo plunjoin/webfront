@@ -38,12 +38,33 @@ func TestHandlerStartsDevServerWithDevTag(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
-		`var BASE = "/admin";`,
-		`var ENTRY = "/admin/src/main.tsx";`,
-		"BASE + '/__wf_hmr'",
+		`src="/admin/@wf/overlay.js"`,
+		`type="module" src="/admin/@wf/boot"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("dev 外壳缺少 %q:\n%s", want, body)
+		}
+	}
+
+	// 入口与 BASE 现在固化在外部 boot / runtime 模块里。
+	boot := httptest.NewRecorder()
+	h.ServeHTTP(boot, httptest.NewRequest(http.MethodGet, "/admin/@wf/boot", nil))
+	for _, want := range []string{
+		`"/admin/src/main.tsx"`,
+		`"/admin/@wf/client"`,
+	} {
+		if !strings.Contains(boot.Body.String(), want) {
+			t.Fatalf("boot 缺少 %q:\n%s", want, boot.Body.String())
+		}
+	}
+	client := httptest.NewRecorder()
+	h.ServeHTTP(client, httptest.NewRequest(http.MethodGet, "/admin/@wf/client", nil))
+	for _, want := range []string{
+		`const BASE = "/admin";`,
+		"BASE + '/__wf_hmr'",
+	} {
+		if !strings.Contains(client.Body.String(), want) {
+			t.Fatalf("runtime 缺少 %q:\n%s", want, client.Body.String())
 		}
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/plunjoin/webfront/adapter"
 )
 
 // Option 修改 dev server 的默认行为。在 NewDevServer 探测依赖之前生效。
@@ -29,6 +31,7 @@ type config struct {
 	externalSet bool
 	publicDir   string
 	publicSet   bool
+	adapters    []adapter.Adapter
 }
 
 // newConfig 依次应用选项。nil 选项直接跳过，方便调用方按条件构造。
@@ -75,6 +78,23 @@ func WithPublicDir(dir string) Option {
 	return func(c *config) {
 		c.publicSet = true
 		c.publicDir = dir
+	}
+}
+
+// WithAdapters 追加框架适配器（Vue 始终默认注册，后注册者优先）。
+//
+// 适配器决定 dev server 额外监听哪些扩展名、哪些模块可以 self-accept，
+// 以及广播给浏览器的 HMR kind。dev 核心只依赖 adapter.Adapter 接口，
+// 具体实现（adapter/vue 等）由调用方注入：
+//
+//	dev.WithAdapters(svelte.Adapter{})
+func WithAdapters(adapters ...adapter.Adapter) Option {
+	return func(c *config) {
+		for _, a := range adapters {
+			if a != nil {
+				c.adapters = append(c.adapters, a)
+			}
+		}
 	}
 }
 

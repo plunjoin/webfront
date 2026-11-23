@@ -89,8 +89,8 @@ func TestDevServerImportMapAndDeps(t *testing.T) {
 	}
 }
 
-// TestDevIndexClientScript 保证注入浏览器的 HMR 脚本本身是合法 JS，
-// 并且带上了"后端重启后自动重载"的能力（wf dev 依赖它）。
+// TestDevIndexClientScript 保证 dev 外壳只引用外部脚本，且这些脚本本身是
+// 合法 JS。外部化是 CSP 的前提：页面里没有一段内联 HMR 逻辑。
 func TestDevIndexClientScript(t *testing.T) {
 	ds := &DevServer{entry: "/src/main.tsx", rootDeps: map[string]string{}}
 	h := ds.Handler()
@@ -99,34 +99,66 @@ func TestDevIndexClientScript(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	html := rec.Body.String()
 
-	const open = "<script>\n"
-	start := strings.Index(html, open)
-	if start < 0 {
-		t.Fatalf("index 里找不到内联脚本:\n%s", html)
-	}
-	rest := html[start+len(open):]
-	end := strings.Index(rest, "</script>")
-	if end < 0 {
-		t.Fatalf("内联脚本没有闭合:\n%s", html)
-	}
-	script := rest[:end]
-
-	// 用 esbuild 当 JS 解析器：模板字符串拼错会在这里暴露，而不是等到浏览器白屏。
-	if res := api.Transform(script, api.TransformOptions{Loader: api.LoaderJS}); len(res.Errors) > 0 {
-		t.Fatalf("HMR 客户端脚本有语法错误: %+v\n%s", res.Errors, script)
-	}
-	// 覆盖层（Vite 同款）+ 重启探活 + 嵌套依赖错误回溯，一样都不能少。
 	for _, want := range []string{
-		"__wfOverlay", "attachShadow", "unhandledrejection",
-		"/__wf_ping", "/__wf_error", "location.reload()", "wss://",
+		`<script src="/@wf/overlay.js"></script>`,
+		`<script type="module" src="/@wf/boot"></script>`,
 	} {
-		if !strings.Contains(script, want) {
-			t.Fatalf("HMR 脚本缺少 %q", want)
+		if !strings.Contains(html, want) {
+			t.Fatalf("index 缺少 %q:\n%s", want, html)
 		}
 	}
-	// 覆盖层样式必须内联进 Shadow DOM，否则会被宿主页面的 CSS 改掉。
-	if !strings.Contains(script, ".wf-ov-panel") {
-		t.Fatal("覆盖层样式没有随脚本注入")
+	if strings.Contains(html, "<script>") {
+		t.Fatalf("index 不应再包含内联脚本:\n%s", html)
+	}
+
+	parse := func(name, body string) {
+		t.Helper()
+		if res := api.Transform(body, api.TransformOptions{Loader: api.LoaderJS}); len(res.Errors) > 0 {
+			t.Fatalf("%s 有语法错误: %+v\n%s", name, res.Errors, body)
+		}
+	}
+
+	// 覆盖层：Shadow DOM 样式 + 重启提示 + 未处理 rejection。
+	ov := httptest.NewRecorder()
+	h.ServeHTTP(ov, httptest.NewRequest(http.MethodGet, "/@wf/overlay.js", nil))
+	if ov.Code != http.StatusOK {
+		t.Fatalf("GET /@wf/overlay.js = %d", ov.Code)
+	}
+	parse("overlay", ov.Body.String())
+	for _, want := range []string{"__wfOverlay", "attachShadow", "unhandledrejection", ".wf-ov-panel"} {
+		if !strings.Contains(ov.Body.String(), want) {
+			t.Fatalf("覆盖层缺少 %q", want)
+		}
+	}
+
+	// runtime：HMR 记录、批次、重启探活、错误回溯、WebSocket 地址。
+	cl := httptest.NewRecorder()
+	h.ServeHTTP(cl, httptest.NewRequest(http.MethodGet, "/@wf/client", nil))
+	if cl.Code != http.StatusOK {
+		t.Fatalf("GET /@wf/client = %d", cl.Code)
+	}
+	runtime := cl.Body.String()
+	parse("client runtime", runtime)
+	for _, want := range []string{
+		"createHotContext", "__wfHandleMessage", "/__wf_ping", "/__wf_error",
+		"location.reload()", "wss://", "__wfSetImporter",
+	} {
+		if !strings.Contains(runtime, want) {
+			t.Fatalf("HMR runtime 缺少 %q", want)
+		}
+	}
+
+	// boot：只负责动态 import 应用入口。
+	boot := httptest.NewRecorder()
+	h.ServeHTTP(boot, httptest.NewRequest(http.MethodGet, "/@wf/boot", nil))
+	if boot.Code != http.StatusOK {
+		t.Fatalf("GET /@wf/boot = %d", boot.Code)
+	}
+	parse("boot", boot.Body.String())
+	for _, want := range []string{`"/src/main.tsx"`, `"/@wf/client"`, "import(ENTRY)"} {
+		if !strings.Contains(boot.Body.String(), want) {
+			t.Fatalf("boot 缺少 %q:\n%s", want, boot.Body.String())
+		}
 	}
 
 	// 探活端点必须够轻：204 + 不缓存

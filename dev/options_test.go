@@ -77,8 +77,8 @@ func TestDevBasePath(t *testing.T) {
 	html := rec.Body.String()
 	for _, want := range []string{
 		`"/admin/@deps/fake-dep.js"`,
-		`var BASE = "/admin"`,
-		`"/admin/src/main.tsx"`,
+		`src="/admin/@wf/overlay.js"`,
+		`src="/admin/@wf/boot"`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("index 缺少 %q:\n%s", want, html)
@@ -86,6 +86,16 @@ func TestDevBasePath(t *testing.T) {
 	}
 	if strings.Contains(html, `"/@deps/fake-dep.js"`) {
 		t.Errorf("basePath 下不应再出现根路径 import map:\n%s", html)
+	}
+
+	// 入口与 BASE 在外部模块里，且都带挂载前缀。
+	boot := doGet(h, "/admin/@wf/boot")
+	if boot.Code != 200 || !strings.Contains(boot.Body.String(), `"/admin/src/main.tsx"`) {
+		t.Fatalf("boot = %d, body=%s", boot.Code, boot.Body.String())
+	}
+	client := doGet(h, "/admin/@wf/client")
+	if client.Code != 200 || !strings.Contains(client.Body.String(), `const BASE = "/admin";`) {
+		t.Fatalf("client = %d, body=%s", client.Code, client.Body.String())
 	}
 
 	// 直接挂在 /admin/ 下：路径带着前缀进来。

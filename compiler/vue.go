@@ -266,6 +266,21 @@ type SFCResult struct {
 	Code string
 	// Lang 是 <script> / <script setup> 声明的语言（"" / "js" / "ts"）。
 	Lang string
+	// ScriptHash 是 <script> + <script setup> 原文的哈希（不含 template/style）。
+	// dev HMR 用它区分"只改模板/样式"（rerender，保留组件状态）与
+	// "脚本也改了"（reload）。生产构建忽略该字段。
+	ScriptHash string
+}
+
+// SFCOptions controls dev-only output. HMR adds Vue's __hmrId/__file metadata
+// and an import.meta.hot.accept callback that patches the mounted component in
+// place. Production builds must leave it false so no HMR symbols reach dist.
+type SFCOptions struct {
+	HMR bool
+	// PreviousScriptHash 是同一个 SFC 上一次编译返回的 ScriptHash。
+	// 两者相等说明本次只改了模板/样式：产物会调用 Vue 的 rerender，
+	// 保留组件实例的 setup state；不相等（或首次编译）则走 reload。
+	PreviousScriptHash string
 }
 
 // SFCLoader 把 SFC 脚本语言映射成 esbuild 的 Loader。
@@ -295,6 +310,8 @@ type sfcMeta struct {
 	Styles          []sfcStyle `json:"styles"`
 	HasScoped       bool       `json:"hasScoped"`
 	ScriptSrc       string     `json:"scriptSrc"`
+	Script          string     `json:"script"`
+	ScriptSetup     string     `json:"scriptSetup"`
 }
 
 // CompileSFC 用 goja 内嵌的 @vue/compiler-sfc 编译单个 .vue 源为 JS 模块。
@@ -310,13 +327,20 @@ func CompileSFC(rootDir, modulesDir, source, filename string) (string, error) {
 
 // CompileSFCResult 同 CompileSFC，但额外返回脚本语言，供调用方选择 esbuild Loader。
 //
+// 生产构建恒不注入 HMR；dev 需要热更时用 CompileSFCResultWithOptions。
+func CompileSFCResult(rootDir, modulesDir, source, filename string) (SFCResult, error) {
+	return CompileSFCResultWithOptions(rootDir, modulesDir, source, filename, SFCOptions{})
+}
+
+// CompileSFCResultWithOptions 同 CompileSFCResult，可显式开启 dev HMR 产物。
+//
 // 支持的 <style lang>：css / scss / sass / less。预处理器按需从项目依赖目录加载
 // （见 preprocess.go），没装对应包时会在用到的那一刻报出明确指引。
 //
 // 错误契约：**任何编译错误都以 error 返回，不 panic**。goja 把 JS 异常作为
 // *goja.Exception 返回，各阶段再包上文件名与阶段名；这里额外兜一层 recover，
 // 保证即使 VM 或宿主回调里出了意外，也不会把 dev server / 构建进程带走。
-func CompileSFCResult(rootDir, modulesDir, source, filename string) (res SFCResult, err error) {
+func CompileSFCResultWithOptions(rootDir, modulesDir, source, filename string, opts SFCOptions) (res SFCResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			res = SFCResult{}
@@ -361,7 +385,9 @@ func CompileSFCResult(rootDir, modulesDir, source, filename string) (res SFCResu
       return { lang: s.lang || '', content: s.content || '', scoped: !!s.scoped, src: s.src || '' };
     }),
     hasScoped: (desc.styles || []).some(function (s) { return !!s.scoped; }),
-    scriptSrc: (desc.script && desc.script.src) || (desc.scriptSetup && desc.scriptSetup.src) || ''
+    scriptSrc: (desc.script && desc.script.src) || (desc.scriptSetup && desc.scriptSetup.src) || '',
+    script: (desc.script && desc.script.content) || '',
+    scriptSetup: (desc.scriptSetup && desc.scriptSetup.content) || ''
   });
 })()`
 	metaVal, err := vm.RunString(metaJS)
@@ -375,6 +401,12 @@ func CompileSFCResult(rootDir, modulesDir, source, filename string) (res SFCResu
 	if len(meta.Errors) > 0 {
 		return SFCResult{}, fmt.Errorf("%s: %s", filename, strings.Join(meta.Errors, "; "))
 	}
+	// 脚本 hash 只覆盖脚本块（含 lang）：模板/样式改动不能改变它，
+	// 否则每次改模板都会误判成脚本改动而重建组件实例。
+	scriptSum := sha256.Sum256([]byte(meta.ScriptLang + "\x00" + meta.Script + "\x00" +
+		meta.ScriptSetupLang + "\x00" + meta.ScriptSetup))
+	scriptHash := fmt.Sprintf("%x", scriptSum[:])
+	rerenderOnly := opts.PreviousScriptHash != "" && opts.PreviousScriptHash == scriptHash
 	if meta.ScriptSrc != "" {
 		return SFCResult{}, fmt.Errorf("%s: 暂不支持 <script src=%q>，请把脚本内联进 SFC", filename, meta.ScriptSrc)
 	}
@@ -566,14 +598,66 @@ func CompileSFCResult(rootDir, modulesDir, source, filename string) (res SFCResu
 }
 `, strconv.Quote(scopeId), strconv.Quote(scopeId), string(cssJSON), string(cssJSON)))
 	}
+	if opts.HMR {
+		// Vue 的 HMR runtime 用 __hmrId 把"运行中的实例"与模块绑定
+		// （registerHMR 发生在 mount 时，所以必须在模块求值阶段就写好）。
+		extra.WriteString("__script.__hmrId = " + strconv.Quote(scopeId) + ";\n")
+		// __file 用项目相对路径：绝对路径会随构建机变化，也会泄露本机目录结构。
+		fileForHMR := filename
+		if rel, relErr := filepath.Rel(rootDir, filename); relErr == nil &&
+			rel != ".." && !strings.HasPrefix(rel, "../") {
+			fileForHMR = filepath.ToSlash(rel)
+		}
+		extra.WriteString("__script.__file = " + strconv.Quote(fileForHMR) + ";\n")
+	}
 	extra.WriteString("export default __script;\n")
+	if opts.HMR {
+		// accept 回调在"边界模块被重新 import"后由 @wf/client 调用。
+		// 只改模板/样式时用 rerender：直接替换实例的 render 并触发更新，
+		// setup 返回的状态原样保留。脚本也变了才用 reload（可能重置状态），
+		// 根实例由 Vue 自己退化成整页刷新。
+		//
+		// ctx.mode === "reload" 表示这次更新是依赖冒泡或删除引起的，不是
+		// 组件自己的模板改动：必须走 reload 让 setup 重新执行，否则旧 setup
+		// 闭包会继续引用旧依赖，@t 版本化的新模块永远不会被使用。
+		if rerenderOnly {
+			extra.WriteString(fmt.Sprintf(`if (import.meta.hot) {
+  import.meta.hot.accept(function (mod, ctx) {
+    var next = mod && mod.default;
+    var runtime = typeof globalThis !== 'undefined' ? globalThis.__VUE_HMR_RUNTIME__ : null;
+    var forceReload = !!(ctx && ctx.mode === 'reload');
+    if (!forceReload && runtime && typeof runtime.rerender === 'function' && next && typeof next.render === 'function') {
+      runtime.rerender(%s, next.render);
+    } else if (runtime && typeof runtime.reload === 'function' && next) {
+      runtime.reload(%s, next);
+    } else if (typeof location !== 'undefined') {
+      location.reload();
+    }
+  });
+}
+`, strconv.Quote(scopeId), strconv.Quote(scopeId)))
+		} else {
+			extra.WriteString(fmt.Sprintf(`if (import.meta.hot) {
+  import.meta.hot.accept(function (mod) {
+    var next = mod && mod.default;
+    var runtime = typeof globalThis !== 'undefined' ? globalThis.__VUE_HMR_RUNTIME__ : null;
+    if (runtime && typeof runtime.reload === 'function' && next) {
+      runtime.reload(%s, next);
+    } else if (typeof location !== 'undefined') {
+      location.reload();
+    }
+  });
+}
+`, strconv.Quote(scopeId)))
+		}
+	}
 
 	out := ""
 	if tmpl != "" {
 		out += tmpl + "\n"
 	}
 	out += script + "\n" + extra.String()
-	return SFCResult{Code: out, Lang: strings.ToLower(lang)}, nil
+	return SFCResult{Code: out, Lang: strings.ToLower(lang), ScriptHash: scriptHash}, nil
 }
 
 func compileSFC(rootDir, modulesDir, source, filename string) (string, error) {

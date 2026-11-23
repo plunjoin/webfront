@@ -225,6 +225,34 @@ func TestRunBuildCleansStaleArtifacts(t *testing.T) {
 	}
 }
 
+// 非 split 构建也要把入口 import 的 CSS 与静态资源一起落盘：
+// client.css 是 index.html 的 <link> 目标，不能因为返回单个 []byte 而丢掉。
+func TestRunBuildWritesClientCSSAndAssets(t *testing.T) {
+	web := filepath.Join(t.TempDir(), "web")
+	writeTestFile(t, filepath.Join(web, "src", "entry-client.tsx"),
+		`import "./style.css"; import logo from "./logo.svg"; document.title = logo;`)
+	writeTestFile(t, filepath.Join(web, "src", "style.css"), "body{color:red}")
+	writeTestFile(t, filepath.Join(web, "src", "logo.svg"), `<svg/>`)
+
+	if code := Run([]string{"build", "-mode", "spa", "-split=false", web}); code != 0 {
+		t.Fatalf("build exit = %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(web, "dist", "assets", "client.js")); err != nil {
+		t.Fatalf("client.js 未生成: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(web, "dist", "assets", "client.css")); err != nil {
+		t.Fatalf("client.css 未生成: %v", err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(web, "dist", "assets", "logo-*.svg"))
+	if len(matches) != 1 {
+		t.Fatalf("静态资源未落盘: %v", matches)
+	}
+	b, err := os.ReadFile(filepath.Join(web, "dist", "index.html"))
+	if err != nil || !strings.Contains(string(b), "client.css") {
+		t.Fatalf("index.html 没有 link client.css: %q, %v", b, err)
+	}
+}
+
 // -out 指到前端源码目录时，宁可留下旧文件，也不能删用户文件。
 func TestRunBuildTemplateOutSourceDirKeepsFiles(t *testing.T) {
 	web := filepath.Join(t.TempDir(), "web")

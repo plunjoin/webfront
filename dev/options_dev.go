@@ -9,6 +9,9 @@ package dev
 
 import (
 	"github.com/evanw/esbuild/pkg/api"
+
+	"github.com/plunjoin/webfront/adapter"
+	vueadapter "github.com/plunjoin/webfront/adapter/vue"
 )
 
 // applyConfig 把 Option 收集到的配置搬到 DevServer 上。
@@ -23,6 +26,10 @@ func (d *DevServer) applyConfig(c *config) {
 		d.externalSet = true
 		d.externals = c.externals
 	}
+	// Vue 永远是默认适配器；调用方追加的适配器排在后面，同扩展名时胜出。
+	// 只有这个装配点认识具体实现，DevServer 与 HMR 规划（hmr.go）只用接口。
+	list := append([]adapter.Adapter{vueadapter.Adapter{}}, c.adapters...)
+	d.adapters = adapter.New(list...)
 }
 
 // url 给 dev server 自己的路径加挂载前缀。
