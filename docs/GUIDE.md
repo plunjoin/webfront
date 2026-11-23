@@ -4,7 +4,7 @@
 > 每个方法写不写响应、返回什么状态码、缓存头是什么，见 [API 契约](API.md)。
 > 遇到报错直接跳到 [§10 排错](#10-排错按现象查)。
 
-> **本文对应 v0.1.6**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项；v0.1.6 新增免 build tag 的 `dev.Handler` 与 `public/` 静态目录。
+> **本文对应 v0.1.7**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；导入别名（`@/` 与 `tsconfig` `paths`）是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 dev 下 CommonJS 包的具名导入；v0.1.5 新增共享 store 的工程级 manifest 与 `dev.NewDevServer` 的挂载/外置选项；v0.1.6 新增免 build tag 的 `dev.Handler` 与 `public/` 静态目录；v0.1.7 将 HMR 升级为模块图驱动的协议 v2，支持 Vue 组件级热替换、静态资源与 `WithAdapters`。
 
 ## 先看这个：React/Vue 当 Go 的模板引擎
 
@@ -360,6 +360,8 @@ go tool wf build
 web/dist/
 ├── ssr.js                 # 给构建期预渲染用，运行期不需要
 ├── assets/client.js       # 客户端 hydration
+├── assets/client.css      # 入口 import 了 CSS 时
+├── assets/*-<hash>.*      # 入口 import 的图片 / 字体 / wasm
 ├── assets/chunks/*.js
 ├── pages/index.html       # /
 ├── pages/about.html       # /about

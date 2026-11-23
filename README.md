@@ -4,7 +4,7 @@
 
 对标 Vite + Astro 的那一套，但跑在你的 Go 进程里：`import "github.com/plunjoin/webfront"`，把前端挂到已有的 `net/http` / Gin / Echo / Chi 路由上。
 
-> **文档对应 v0.1.6（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径；v0.1.6 新增免 build tag 的 `dev.Handler`、独立 `dev/supervise` 与 `public/` 静态目录。
+> **文档对应 v0.1.7（最新版）**：`-mode template`、`RenderTemplate*`、`SPAHandler()` 和自动 `Mode` 是 v0.1.2 新增；`@/` 与 `tsconfig` `paths` 别名、子目录 `package.json` 子路径解析是 v0.1.3 新增；v0.1.4 修复别名组件的 tsconfig JSX 设置，以及 `wf dev` 下 CommonJS 包的具名导入；v0.1.5 支持多工程共享 store、`dev.NewDevServer` 的挂载/外置选项与 `/@deps` CSS 子路径；v0.1.6 新增免 build tag 的 `dev.Handler`、独立 `dev/supervise` 与 `public/` 静态目录；v0.1.7 将 dev HMR 升级为协议 v2（模块图边界冒泡、批次/prune、说明符版本化），支持 Vue 组件级热替换、静态资源管线、`adapter` 扩展点与 `BuildProfile`。
 
 ```go
 // 一行接入：Engine 就是 http.Handler
@@ -40,7 +40,7 @@ mux.Handle("/", engine)
 | **纯客户端 SPA** | `wf build -mode spa` + `go build .` | **6.89 MB** | 后台、工具型页面——路由和渲染都在浏览器 |
 | **预渲染静态（SSG）** | `wf build` + `go build .` | **6.89 MB** | 内容站、文档、营销页——构建期出 HTML，运行期只发文件 |
 | **动态 SSR** | `wf build` + `go build -tags dynamic .` | **15.62 MB** | 需要按请求查库、按用户渲染的页面 |
-| **开发服务器** | `wf dev`（`go run -tags dev .` 只有前端 HMR） | 11.36 MB | 本地开发：esbuild 单文件转译 + WebSocket HMR；`wf dev` 额外负责改 `.go` 自动重编译重启 |
+| **开发服务器** | `wf dev`（`go run -tags dev .` 只有前端 HMR） | 11.36 MB | 本地开发：模块图 + HMR 协议 v2；`wf dev` 额外负责改 `.go` 自动重编译重启 |
 
 > 四种形态共用同一个 `main.go`：静态 / SPA 走默认构建，动态 SSR 用 `-tags dynamic`，开发服务器用 `-tags dev`。静态与 SPA 的差别只在 `wf build` 的产物，`main.go` 按 `eng.Mode()` 自动分派。引擎有没有被链进二进制，由你 `import` 哪个包决定。
 >
@@ -51,13 +51,13 @@ mux.Handle("/", engine)
 ## 安装
 
 ```bash
-go get github.com/plunjoin/webfront@v0.1.6
+go get github.com/plunjoin/webfront@v0.1.7
 
 # 可选：把 CLI 固定成项目工具（推荐，版本随 go.mod 走，无需全局安装）
 go get -tool github.com/plunjoin/webfront/cmd/wf
 
 # 或者装成全局命令
-go install github.com/plunjoin/webfront/cmd/wf@v0.1.6
+go install github.com/plunjoin/webfront/cmd/wf@v0.1.7
 ```
 
 在 Go 代码中引用：
@@ -355,8 +355,8 @@ r.Handle("/*", eng)
 | 方式 | 之后怎么调用 | 适用 |
 | --- | --- | --- |
 | `go get -tool github.com/plunjoin/webfront/cmd/wf` | `go tool wf build` | **推荐**：版本固定在 `go.mod`，不碰 PATH（Go 1.24+） |
-| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.6` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
-| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.6` | 直接跑 | 一次性使用，不登记任何东西 |
+| `go install github.com/plunjoin/webfront/cmd/wf@v0.1.7` | `wf build` | 想要全局命令（`GOBIN` 需在 PATH） |
+| `go run github.com/plunjoin/webfront/cmd/wf@v0.1.7` | 直接跑 | 一次性使用，不登记任何东西 |
 
 > 只 `go get github.com/plunjoin/webfront` 是不够的：Go 只把**被 import 的包**的依赖记进
 > `go.sum`，而 CLI 依赖的 esbuild / goja 你并没有 import，裸 `go run .../cmd/wf` 会报
@@ -381,7 +381,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 | --- | --- | --- |
 | `rootDir` | `.` | 包含 `web/` 的目录；直接指向 `web/` 也行 |
 | `-modules` | `auto` | 依赖目录名；显式指定后不探测。非 `node_modules` 时自动作为 esbuild 的 `NodePaths` |
-| `-split` | `true` | 客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE（入口 import CSS 时不要关：非 split 路径只写 JS，CSS 会丢） |
+| `-split` | `true` | 客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE，入口 import 的 CSS 与静态资源仍会一起落盘 |
 | `-prerender` | `auto` | 存在 `<web>/routes.json` 就额外产出 `dist/pages/*.html`（运行期可零 JS 引擎）；传 `-` 关闭 |
 | `-base` | `/` | 部署前缀（如 `/site` 或 `/admin`）；资源路径与外壳 HTML 会自动带上 |
 | `-out` | `<webDir>/dist` | 产物输出目录（支持多前端子工程输出到独立子目录） |
@@ -400,7 +400,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 | --- | --- |
 | `wf install` | `compiler.InstallStore` |
 | `wf build`（SSR） | `compiler.BuildSSRWith` |
-| `wf build`（客户端） | `compiler.BuildClientSplit` / `BuildClientWith` |
+| `wf build`（客户端） | `compiler.BuildClientSplit` / `BuildClientFiles`（或 `*WithOptions` 变体） |
 | `wf build -prerender` | `compiler.ReadRoutes` + `PrerenderWithBase` |
 | `wf dev` | `supervise.Run`（或自己起 `dev.NewDevServer`，仅 `-tags dev` 构建） |
 
@@ -519,11 +519,22 @@ mux.Handle("/admin/", ds.Handler())   // import map / HMR / 广播都会带 /adm
 | `WithExternal(specs...)` | 所有 root 依赖 | 打包 `/@deps/<pkg>.js` 时把别的 root 依赖留成裸导入，由 import map 复用同一份模块（react-dom 不再内联 react）；传空参数关闭 |
 | `WithDefine(map)` | `NODE_ENV=development`（Vue 项目自动补 `__VUE_*__`） | 合并进 esbuild 的 define，自定义项优先 |
 | `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录；目录请求回其 `index.html`，找不到才回 SPA 外壳。传空串关闭；根路径永远给 HMR 外壳 |
+| `WithAdapters(adapters...)` | Vue（`adapter/vue` 内置） | 追加框架适配器：扩展名监听、self-accept、HMR kind 与 `connected` 能力表由注册表统一驱动；同扩展名后注册者胜出 |
 
 `/@deps` 还支持 CSS 子路径：`import "nprogress/nprogress.css"` 会返回一个
 "导入即注入 `<style>`" 的 ESM 模块，不需要调用方自己处理样式文件。外置的 CJS 依赖
 （如 react-dom 内部 `require("react")`）会被改写成静态 `import`，不会留下浏览器
 跑不了的动态 `require`。
+
+**HMR 行为（协议 v2）**：WebSocket 连上先收到 `connected`（协议号、buildId、能力表），
+之后一次保存只发一条 `batch`（`seq` 单调递增，可带 `updates` 与 `prunes`）。服务端沿模块图
+把变化冒泡到最近的 self-accept 边界（Vue 组件 / CSS / 手写的 `import.meta.hot.accept`）；
+边界与脏链上的本地依赖重新执行时自动带 `?t=<seq>`，浏览器不会命中旧 ESM 缓存。
+Vue 边界分两种模式：自己的模板/样式改动走 `rerender` 保留 setup 状态；依赖冒泡或删除
+引起的更新带 `mode:"reload"`，实例重建、setup 重新执行，确保用上新依赖。找不到边界
+（入口、孤儿、环）或收到未知消息时整页刷新；同一窗口内的删除+新建（编辑器原子保存）
+不会误 prune，首次编译失败的模块修好后也会自动整页恢复。实现细节见
+[ARCHITECTURE.md](ARCHITECTURE.md) §7.2。
 
 ---
 
@@ -565,7 +576,7 @@ minify + gzip 两道下来：原始 258KB → 139KB → **45KB**（−82%），�
 - **`<style>` 与 Scoped 样式**：自动调用 `compileStyle` 提取样式，支持 `scoped` 作用域哈希（`data-v-xxxx`）；
 - **`<style lang="scss|sass|less">`**：同样零 Node——预处理器本体（dart-sass / less 核心）从项目自己的依赖目录解析，esbuild 打成 IIFE 后在 goja 里跑，`@use` / `@import` 的文件读取由 Go 注入的回调完成，相对路径、`_partial`、`node_modules` 回退都能解析；
 - **动态 SSR 防闪烁（FOUC）**：服务端渲染时将组件样式汇集注入 HTML `<head>`，首屏即带有完整样式；
-- **开发态（Dev）实时热更与样式去重**：开发态通过 `data-wf-id` 精确覆盖样式标签，杜绝 HMR 重复堆积；修改子组件自动轻量刷新穿透原生 ESM 缓存。
+- **开发态（Dev）组件级 HMR**：Vue 组件自己 accept——只改模板/样式时原地替换 render，setup 状态保留；改脚本或依赖冒泡时重建组件实例，确保 setup 重新执行。根组件的脚本改动由 Vue 退化为整页刷新，模板/样式改动仍原地更新。CSS 通过 `data-wf-id` 原位覆盖，杜绝标签堆积。
 
 ```tsx
 // web/src/entry-server.vue.tsx
@@ -582,7 +593,7 @@ export async function render(url: string, props: Record<string, any>) {
 
 > `lang="stylus"`、`<template lang="pug">`、`lang="tsx"` 仍不支持（`<style src>` 也不支持，请内联）：遇到时直接报错，而不是产出坏样式/坏模块。
 
-> 开发态（`dev` 服务器）与生产构建均已完整支持 `.vue` 单文件组件编译、`<style>` / `<style scoped>` 提取与实时 HMR 热更新。
+> 开发态（`dev` 服务器）与生产构建均支持 `.vue` 单文件组件编译与 `<style>` / `<style scoped>` 提取；dev 下组件级 HMR 保留嵌套组件状态（模板/样式改动 `rerender`，脚本改动或依赖冒泡 `reload`），无边界模块与入口改动仍整页刷新。生产产物不含任何 HMR 符号。
 
 ---
 
@@ -598,6 +609,9 @@ export async function render(url: string, props: Record<string, any>) {
 | `wf dev` 的 Go 热更是"重启进程" | 重启窗口（2–3s）内请求会失败 | 只用于开发；线上靠多副本滚动更新 |
 | 错误页里的栈指向打包产物 | SSR 报错显示 `ssr.js:1482:19`，不是 `App.tsx:12` | 生产构建不输出栈；需要精确行号时用 `wf build` 的报错（esbuild 有 code frame） |
 | 开发态错误页只在 `Config.Dev` / `WF_DEV` 下出现 | 直接 `go run .` 起服务时看不到可视化错误 | `wf dev` 会自动注入 `WF_DEV=1` |
+| HMR 的 `accept(deps, cb)` 仅保守支持 | 只声明依赖级 accept 的模块会整页刷新 | 用 self-accept（不传 deps），或等后续切片的粒度化支持 |
+| CSS 的 `@import` / `url()` 不参与 HMR 版本化 | 注入 `<style>` 的相对 URL 按文档解析，改 CSS 依赖可能读到旧资源 | CSS 自身仍 self-accept 整体重编译；依赖版本化留给后续切片 |
+| 自定义 adapter 目前只接管扩展名 / 边界 / kind | 新框架的源码编译仍需内置编译器（当前只有 Vue） | 用 Vue；或后续为 adapter 增加编译钩子 |
 
 ---
 
@@ -606,9 +620,11 @@ export async function render(url: string, props: Record<string, any>) {
 ```
 webfront/
 ├── webfront.go · static.go   核心运行时（只依赖标准库）
-├── compiler/                 构建期：esbuild / SFC / store / SSG
+├── compiler/                 构建期：esbuild / SFC / store / SSG（BuildProfile）
+├── module/                   模块身份 + imports/importers 图（纯标准库）
+├── adapter/                  框架适配器接口 + 内置 Vue（纯标准库）
 ├── jsruntime/                运行期：goja 引擎池
-├── dev/                      开发态：转译 + HMR
+├── dev/                      开发态：转译 + 模块图 + 静态资源 + HMR
 ├── devui/                    开发态错误界面：覆盖层 + 错误页（纯标准库）
 ├── cli/                      CLI 逻辑（可导入；版本随使用者的 go.mod 走）
 ├── cmd/wf/                   极薄入口：os.Exit(cli.Run(os.Args[1:]))
@@ -646,12 +662,22 @@ go run ./cmd/wf dev ./_examples/basic   # 或 cd _examples/basic 后直接 wf de
 
 ## 状态
 
-v0.1.6 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
+v0.1.7 已发布；以下均已端到端验证（Go 1.27 / windows-amd64，`CGO_ENABLED=0`）：
 
 - 三种构建组合（默认 / `dynamic` / `dev`）`go build` + `go vet` 全通过
 - 静态 / 动态两种生产构建的依赖图里，esbuild / fsnotify / 任意 Web 框架计数为 **0**
 - 同一路由：goja 动态渲染输出 与 构建期预渲染产物 **逐字节一致**
 - 客户端 258KB → 45KB（gzip），二次访问 304
+- Vue 嵌套组件模板热替换保留 setup 状态、脚本改动重建实例、无边界模块整页刷新（Chromium 实测）
+- HMR 协议 v2 的边界/批次/prune/未知消息用例由 Go + goja 测试覆盖，生产产物零 HMR 符号
+
+### v0.1.7 相对 v0.1.6
+
+- **HMR 协议 v2**：WebSocket 先发 `connected`（协议号 / buildId / 能力表），一次保存只发一条 `batch`（`seq`、`updates`、`prunes`）；变化沿模块图冒泡到最近的 self-accept 边界，无边界（入口 / 孤儿 / 环）整页刷新。客户端按 `seq` 串行执行，删除、原子保存与首次编译失败恢复都有明确兜底
+- **说明符版本化**：脏模块链上的本地依赖自动带 `?t=<seq>`，浏览器不会命中旧 ESM 缓存；未变化的兄弟分支仍复用缓存。Vue 依赖冒泡或删除引起的更新带 `mode:"reload"`，确保 setup 重新执行
+- **Vue 组件级热替换**：模板/样式改动走 `__VUE_HMR_RUNTIME__.rerender`，保留嵌套组件 setup 状态；脚本改动走 `reload`。生产 client / SSR 产物不含任何 HMR 符号
+- **静态资源与客户端产物**：dev 下图片 / 字体 / `.wasm` 通过 `/@wf/asset/` 直出，`?raw` / `?url` 可用；`wf build` 用 `LoaderFile` 产出带 hash 的资源，SSR 用 `LoaderDataURL` 内联。非 split 构建也通过 `BuildClientFiles` 落盘入口 CSS 与静态资源
+- **模块图与扩展点**：新增 `module`（canonical ID、版本化 imports/importers 图）、`adapter` / `adapter/vue` 与 `dev.WithAdapters`；`compiler.BuildProfile` 及 `BuildSSRWithOptions` / `BuildClientWithOptions` / `BuildClientFilesWithOptions` / `BuildClientSplitWithOptions` 统一构建配置
 
 ### v0.1.6 相对 v0.1.5
 

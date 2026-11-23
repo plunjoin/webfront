@@ -3,7 +3,7 @@
 > 这篇不介绍“怎么用”，只回答**调用之后到底发生了什么**：谁写响应、状态码是什么、错误返回后还能不能写、缓存头是什么。
 > 面向已经能跑通、但想精确控制行为的人。第一次接入看 [接入指南](GUIDE.md)。
 
-下文按当前源码（v0.1.6）描述。版本差异见 [§10](#10-版本差异)。
+下文按当前源码（v0.1.7）描述。版本差异见 [§10](#10-版本差异)。
 
 ## 1. `New(Config)` 与生命周期
 
@@ -370,13 +370,14 @@ func PageFile(url string) string {
 ├── assets/
 │   ├── client.js           # 入口
 │   ├── client.css          # 入口 import 了 CSS 时
+│   ├── logo-<hash>.svg     # 入口 import 的静态资源（图片 / 字体 / wasm）
 │   └── chunks/*.js         # -split=true（默认）时的 vendor / 动态 chunk
 ├── index.html              # 非 template 模式生成
 └── pages/*.html            # 预渲染时（template 模式不产）
 ```
 
 - `index.html` 固定包含 `<div id="root"></div>` 和 `<script type="module" src="<base>/assets/client.js">`；存在 `assets/client.css` 时加 `<link>`。
-- `-split=false` → 单文件 IIFE：`assets/client.js`，没有 chunks。注意这条路径只取 esbuild 的第一个输出文件：入口 import 了 CSS 时 CSS 会被丢弃（不报错），有样式就保持默认 `-split=true`。
+- `-split=false` → 单文件 IIFE：`assets/client.js`，没有 chunks；入口 import 的 CSS 与静态资源仍会落盘为 `client.css` / `<name>-<hash>.<ext>`，不会丢样式。
 - `-mode template` → 只产 `ssr.js`；没有 `assets/` / `index.html` / `pages/`，也不要求客户端入口。`-split` 与 `-prerender` 在这条路径下不生效。
 - `-out` 指定输出目录；相对路径相对**当前工作目录**（不是 `webDir`）。
 - **构建只清理自己管理的固定产物**：成功后按需删除本次不再产出的 `ssr.js`、`pages/`，template 模式还会删 `index.html` / `assets/`；本次没产 CSS 时，旧的 `assets/client.css` 也会先删掉，避免外壳继续引用过期样式。清理只在产物目录位于前端工程内部时执行——`-out web`（工程根）或工程外目录会跳过，宁可留下旧文件也不删源码。删除路由后遗留的旧 chunk、旧 hash 文件、用户自己放进 `dist` 的静态文件不会被清理，仍会被 `//go:embed` 打进二进制；发布构建前建议 `rm -rf <distDir>`。
@@ -452,10 +453,20 @@ portal := dev.Handler("web/portal", func() http.Handler { return webui.PortalHan
 | `WithExternal(specs...)` | 所有 root 依赖 | 按包名匹配（含子路径）；命中项在 `/@deps` 打包时保持裸导入，由 import map 复用同一份。传空参数关闭自动外置；入口包自身内部的导入不外置 |
 | `WithDefine(map)` | `process.env.NODE_ENV="development"`；Vue 依赖自动补 `__VUE_*__` | 合并进 dev 的所有 esbuild 构建/转译 define，调用方同名项优先 |
 | `WithPublicDir(dir)` | `<root>/public` | 未命中内部路由的请求回退到该目录：文件按 URL 原样返回（`no-cache`，支持 `Last-Modified`/304），目录请求回目录下的 `index.html`，找不到才回 SPA 外壳。相对 root 或绝对路径均可；传空串关闭。根路径永远给 HMR 外壳，`public/index.html` 顶不掉开发入口 |
+| `WithAdapters(adapters...)` | Vue（`adapter/vue` 内置） | 追加框架适配器（`adapter.Adapter`：`Name` / `Extensions` / `SelfAccepts` / `HMRKind`）。扩展名监听、HMR 边界、update kind 与 `connected.capabilities` 统一由注册表驱动；同扩展名后注册者胜出 |
 
 外置 CJS 依赖里的 `require("react")` 会被改写成顶部静态 `import * as`，不留下浏览器无法执行的 `__require()`。`/@deps/<pkg>/<file>.css`（如 `nprogress/nprogress.css`）返回"导入即注入 `<style>`"的 ESM，而不是当 JS 入口打包。
 
 ## 10. 版本差异
+
+### v0.1.6 → v0.1.7：HMR 协议 v2、模块图与静态资源
+
+- dev HMR 升级到协议 v2：`connected` 握手携带 `protocol` / `buildId` / `capabilities`；一次防抖窗口只发一条 `batch`（单调 `seq`、`updates`、`prunes`），客户端严格按序执行并兼容旧消息。
+- 新增 `module` 包：`CanonicalID` 统一项目根相对身份，Windows 大小写不敏感；`Graph` 维护 `Node{Version,Hash,SelfAccept,HMRKind,Imports,Importers}` 与反向索引，HMR 沿 importers 冒泡到最近边界。
+- Vue SFC 组件级热替换：`CompileSFCResultWithOptions(..., SFCOptions{HMR:true})` 注入 `__hmrId` / `__file` 与 `accept`；模板/样式改动走 `rerender` 保留状态，脚本或依赖变化走 `reload`。生产构建不注入 HMR。
+- 静态资源：dev 下 `.svg` / 图片 / 字体 / `.wasm` 导入返回 `/@wf/asset/` URL，`?raw` / `?url` 可用；构建期用 `BuildProfile` 的 `LoaderFile` 产出 hash 资源，SSR 用 `LoaderDataURL` 内联。
+- 新增 `compiler.BuildProfile` 与 `BuildSSRWithOptions` / `BuildClientWithOptions` / `BuildClientFiles` / `BuildClientFilesWithOptions` / `BuildClientSplitWithOptions`；非 split 客户端构建通过 `BuildClientFiles` 同时返回 JS、CSS 与静态资源。
+- 新增 `adapter.Adapter` / `adapter.Registry`、默认 `adapter/vue` 与 `dev.WithAdapters`：扩展名监听、HMR 边界、update kind 与 `connected.capabilities` 由注册表驱动。
 
 ### v0.1.5 → v0.1.6：tag-free dev 接线与 public/
 

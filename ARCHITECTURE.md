@@ -2,7 +2,7 @@
 
 > 一个 100% 纯 Go 编写、可嵌入任意 `net/http` / Gin 路由的前端编译器与 SSR 运行时库（配极薄 CLI），单仓库同进程搞定 SPA、SSR、SSG 与 Islands 孤岛架构。对标并替代 Vite + Astro，完全摒弃 Node.js。
 >
-> **状态：v0.1.6 已实现并验证**（v0.1.5 已发布；v0.1.6 新增免 build tag 的 `dev.Handler`、`dev/supervise` 子包与 `public/` 静态目录）。最后更新：2026-11-19。
+> **状态：v0.1.7 已实现并验证**（v0.1.6 已发布；v0.1.7 新增 HMR 协议 v2、模块图、静态资源管线、`adapter` 扩展点与 `BuildProfile`）。最后更新：2026-11-23。
 > 验证环境：Go 1.27.0 / windows-amd64，全部 `CGO_ENABLED=0`。
 > 本文档描述的是**代码里真实存在的实现**，所有体积、字节数均为实测值；与草案不一致之处见 §0。
 
@@ -10,9 +10,9 @@
 
 ## 0. 与设计草案（v0）的差异速览
 
-| 维度 | 草案 v0 | 现状 v0.1.6 |
+| 维度 | 草案 v0 | 现状 v0.1.7 |
 | --- | --- | --- |
-| 包结构 | 单包 `pkg` | **6 个包按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `cli` / `cmd/wf`） |
+| 包结构 | 单包 `pkg` | **按需付费**（`webfront` / `compiler` / `jsruntime` / `dev` / `module` / `adapter` / `cli` / `cmd/wf`，适配器实现单独成包） |
 | JS 引擎 | go-quickjs 双后端 | **单一 goja**（+9.5MB）；完整 ES2023 引擎已从代码移除，仅作文档备选（§5.6） |
 | 渲染时机 | 仅运行期 | **运行期动态 SSR** 或 **构建期预渲染（SSG）**，后者运行期零引擎 |
 | `Config.SSRBundle` | 有此字段 | **已删除**，改为注入 `Renderer` 接口实现（解耦引擎与引擎二进制） |
@@ -21,7 +21,7 @@
 | 安装器 API | `InstallFromLock` / `InstallFromLockDir` | 合并为 `InstallStore` |
 | 框架适配 | 库内置 `WrapGin`（硬依赖 gin） | **移除**，`Engine` 即 `http.Handler`，使用者一行 `gin.WrapH`（§3.6） |
 | 体积 | 未评估 | 三档实测：**6.89 / 15.62 / 11.36 MB**（另：备选引擎形态 33.14 MB，代码已移除） |
-| dev 下的 `.vue` | 计划支持 | **已完整支持**（含 SFC 编译、`<style>` 提取与 HMR 热更，见 §7.1） |
+| dev 下的 `.vue` | 计划支持 | **已支持**（SFC 编译、`<style>` 提取、组件级 HMR：模板/样式改动保留组件状态，脚本改动才重建实例，见 §7.1 / §7.2） |
 
 ---
 
@@ -86,7 +86,8 @@ webfront/
 ├── webfront.go          核心：Config / Engine / Renderer / HTML 拼装   ← 仅 stdlib
 ├── static.go            核心：StaticHandler（gzip 预压缩 + sha1 ETag + 304）
 ├── compiler/            构建期：esbuild 打包 / SFC / store / SSG 预渲染
-│   ├── bundler.go         BuildSSRWith · BuildClientWith · BuildClientSplit
+│   ├── bundler.go         BuildSSRWith · BuildClientWith · BuildClientSplit（*WithOptions 变体）
+│   ├── buildprofile.go    BuildProfile：Mode / Define / Target / SourceMap / Loaders / PublicPath
 │   ├── engine.go          New()：构建 SSR 后起引擎（单机自编译场景）
 │   ├── prerender.go       ReadRoutes · Prerender · PageFile
 │   ├── install.go         InstallStore（lockfile 驱动的纯 Go 安装器）
@@ -94,6 +95,11 @@ webfront/
 │   ├── alias.go           导入别名（@/、tsconfig paths）+ 源码路径补全
 │   ├── vue.go             @vue/compiler-sfc 的 esbuild 插件
 │   └── preprocess.go      <style lang="scss|sass|less"> 的纯 Go 预处理器
+├── module/              框架无关的模块身份与图（stdlib）
+│   ├── id.go              canonical ID：项目根相对 / realpath / Windows 小写比较
+│   └── graph.go           Node{ID,URL,Version,Hash,SelfAccept,HMRKind,Imports,Importers} + 反向索引
+├── adapter/              框架适配器 seam（stdlib）：扩展名 / self-accept / HMR kind
+│   └── vue/              默认 Vue SFC 适配器
 ├── jsruntime/           运行期：JS 引擎池（goja）
 │   ├── goja.go            Pool + 宿主 shim + 微任务收口
 │   └── quote.go           JS 字符串字面量转义
@@ -101,7 +107,9 @@ webfront/
 │   ├── handler.go        Handler：普通构建返回 fallback，-tags dev 返回 DevServer
 │   ├── handler_prod.go   //go:build !dev：只做 fallback 透传（纯标准库）
 │   ├── handler_dev.go    //go:build dev：启动 DevServer
-│   ├── dev.go            DevServer：按需转译 / @deps / WebSocket（//go:build dev）
+│   ├── dev.go            DevServer：按需转译 / 模块图 / @deps / 静态资源 / WebSocket（//go:build dev）
+│   ├── hmr.go            HMR v2：connected / batch / 边界冒泡 / prune
+│   ├── runtime.go        /@wf/client · /@wf/boot · /@wf/overlay.js
 │   └── supervise/        wf dev：进程级热重载（重编译 + 换进程 + 探活）
 ├── cli/                 CLI 逻辑（可导入：cli.Run 返回退出码，不 os.Exit）
 ├── cmd/wf/              极薄入口：os.Exit(cli.Run(os.Args[1:]))
@@ -651,12 +659,16 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 | 路由 | 行为 |
 | --- | --- |
-| `GET /` | 返回注入 HMR 客户端（含错误覆盖层）的 HTML 骨架；根路径不会被 `public/index.html` 顶掉 |
+| `GET /` | 返回 HTML 骨架：import map（有别名 / npm 映射时）+ 覆盖层脚本 + 外部 `type=module` boot（应用脚本不内联）；根路径不会被 `public/index.html` 顶掉 |
+| `GET /@wf/client` | HMR 运行时单例 ESM（全站只此一份）：`createHotContext`、批次串行队列、重连 |
+| `GET /@wf/boot` | 入口启动脚本：`import(entry)`，成功调 `render()`，失败回读 `/__wf_error` 盖错误层 |
+| `GET /@wf/overlay.js` | `devui` 错误覆盖层（普通脚本，先于 boot 加载） |
 | `GET /*`（未命中其他路由） | 先查 `<root>/public`（`WithPublicDir` 可改/关）：普通文件直出，目录回其 `index.html`，仍未命中回 SPA 骨架 |
-| `GET /src/*` | 读源文件 → `esbuild.Transform`（毫秒级）→ 返回 ESM |
+| `GET /src/*` | 读源文件 → `esbuild.Build`（全部依赖 External）→ 返回 ESM，并记录 imports 图 |
 | `GET /@fs/*` | 别名指向 `src/` 之外的项目内文件；越出项目根目录一律 400 |
+| `GET /@wf/asset/*` | 静态资源原始字节（图片 / 字体 / wasm）；`Cache-Control: no-cache` |
 | `GET /@deps/*` | 按需打包 npm 裸模块为 ESM 并内存缓存（配合 ImportMap 极速裸导入） |
-| `GET /__wf_hmr` | 升级 WebSocket，推送变更事件 |
+| `GET /__wf_hmr` | 升级 WebSocket；先发 `connected`（协议号 / buildId / 能力表），之后按 batch 广播；每客户端 writer goroutine + 30s ping + 10s 写期限 |
 | `GET /__wf_ping` | 204 + `no-store`；Go 进程重启期间浏览器靠它判断"服务回来了没有" |
 | `GET /__wf_error` | 最近一次编译错误（`{id,path,body,at}`）；`?since=N` 已是最新时 204 |
 
@@ -664,10 +676,26 @@ A 与 B 相差 **2.3 倍**：同一份业务代码，能不能把渲染搬到构
 
 | 扩展名 | 处理 |
 | --- | --- |
-| `.ts` / `.tsx` / `.js` / `.jsx` | `api.Transform` → ESM，`process.env.NODE_ENV="development"` |
-| `.css` | Transform 出 CSS 后包成"导入即注入 `<style>`"的 ESM 模块 |
+| `.ts` / `.tsx` / `.js` / `.jsx` | `api.Build`（`Bundle` + 全 external + inline sourcemap）→ ESM，`process.env.NODE_ENV="development"`；`OnResolve` 记录依赖边 |
+| `.css` | `api.Build` 解析 `@import` / `url()` 并记录边，CSS 包成"导入即注入/替换 `<style>`"的 ESM 模块（稳定 `data-wf-id`） |
 | `.json` | `LoaderJSON` + `FormatESModule` → `export default {...}` |
-| `.vue` | `compiler.CompileSFCResult`（SFC 编译 + 预处理器 + 作用域样式提取注入 + 预编译 VM 池） |
+| `.vue` | `compiler.CompileSFCResult`（SFC 编译 + 预处理器 + 作用域样式提取注入 + 预编译 VM 池），产物再过一遍 `api.Build` 收集 imports |
+| `.svg` / `.png` / 字体 / `.wasm` | 返回 `export default "/@wf/asset/<id>"`；`?raw` 返回文本，原始字节走 `/@wf/asset/` |
+
+**模块图（HMR 地基）**：每次编译用 `api.Build{Bundle:true, Write:false}` + 一个
+`OnResolve` 插件把所有 import 标成 `External`：产物里的说明符保持原样，浏览器仍按
+import map / 相对路径解析；服务端同时拿到 `imports`。节点身份来自 `module.CanonicalID`
+（项目根相对、slash、realpath、Windows 小写比较），所以 `/src/App.tsx`、`/@fs/src/App.tsx`
+和从别的文件 import 出来的 `src/App.tsx` 是同一个节点。`DevServer.Graph()` 暴露
+`Node{ID,URL,Version,Hash,SelfAccept,HMRKind,Imports,Importers}`；内容 hash 不变时 version 不增长。
+HMR 的边界传播与说明符版本化都建立在这张图上：变化模块沿 importers 冒泡到最近的
+self-accept 边界（Vue / CSS / 用户手写 accept），边界重新执行；无边界（抵达入口、
+孤儿、环）则整页刷新（§7.2）。
+
+**静态资源**：`import logo from './logo.svg'` 在 dev 请求 `/src/logo.svg`，服务端返回
+`export default "/@wf/asset/src/logo.svg"`；`<img src>` / CSS 用 `/@wf/asset/` 拿原始字节。
+构建期由 `BuildProfile` 的 `LoaderFile` 产出带 hash 的资源文件（SSR 用 `LoaderDataURL`
+内联，避免 goja 侧需要资源宿主）。`?raw` 返回文本模块，`?url` 与默认行为一致。
 
 **扩展名补全**：浏览器不做解析，`import App from './App'` 会原样请求 `/src/App`。构建期由
 esbuild 的 `resolveExtensions` 代劳，dev 期没有这层，所以 `readSrc` 自己按
@@ -714,23 +742,44 @@ manifest 按工程分文件，见 §4.6。
 - define 表默认 `process.env.NODE_ENV="development"`；root 依赖含 `vue` / `@vue/*` 时自动补
   `__VUE_OPTIONS_API__=true`、`__VUE_PROD_DEVTOOLS__=false` 等特性开关；`WithDefine` 追加项优先。
 
-### 7.2 HMR 协议
+### 7.2 HMR 协议（v2）
 
-服务端 → 客户端只有一种消息：
+WebSocket 建立后服务端先发握手，再发批次；一次保存永远只对应一条 batch：
 
 ```json
-{ "type": "update", "path": "/src/App.tsx" }
+{ "type": "connected", "protocol": 2, "buildId": "lq3…", "capabilities": { "batch": true, "css": true, "vue": true } }
+{ "type": "batch", "seq": 7, "buildId": "lq3…", "timestamp": 1730000000000,
+  "updates": [ { "type": "update", "path": "/src/App.vue", "id": "src/App.vue", "kind": "vue", "version": 3, "mode": "reload" } ],
+  "prunes": [ { "id": "src/old.ts", "path": "/src/old.ts" } ] }
 ```
 
-客户端收到后根据模块类型自适应处理：
-1. **主入口模块**（包含 `render` 导出）：直接调用最新 `mod.render()` 实现原地热替换；
-2. **`.css` 样式模块**：执行 `import(path + '?t=...')` 动态更新覆盖 DOM 中的 `<style>` 标签，无需整页刷新；
-3. **普通子组件**（如 `App.tsx`、`App.vue`）：触发轻量整页刷新（依赖已被内存缓存，耗时 < 50ms），彻底穿透浏览器原生静态 ESM 缓存。
-4. **编译失败**：`import()` reject，此时**不能刷新**（刷新只会白屏）。客户端回读那个 500 的响应体，把真正的错误盖在页面上，等下一次成功的 update 自动收场（见 §7.4）。
+- `connected` 的 `protocol` 不匹配、或 `buildId` 变化（Go 进程重启后 DevServer 重建）都会让客户端整页刷新；`capabilities` 含 `batch` / `css` 与全部已注册适配器的名字（Vue 默认在内）。
+- `updates` 是"要重新 import 的边界"，不是"发生变化的文件"；`kind` 为 `vue` / `css` / `json` / `asset` / `js`，CSS 边界的 `type` 是 `css`（语义更明确，处理路径相同），`version` 是该模块的内容版本。`prunes` 是确认删除的模块，客户端先清掉它的 hot 记录与 `data`。
+- `mode` 省略表示 auto（边界自己的模板/样式改动，Vue 可以 rerender）；`mode:"reload"` 表示这次更新来自依赖冒泡或删除，Vue 必须跳过 rerender——setup 不重新执行就拿不到新依赖。同一批次里直接与间接原因同时存在时 reload 优先。
+- 找不到边界时整条 batch 退化成一条 `updates:[{"type":"full-reload","reason":"…"}]`，prunes 清空（刷新后无需清理）。
+- 客户端严格按 `seq` 串行执行：`seq <= last` 直接丢弃，一条 batch 内的 update 顺序执行。未知消息类型、未知 update type、未知 kind、没有 path 的 update、以及"重新执行后不再 self-accept"的模块都走 `location.reload()`——宁可刷新，也不留半更新状态。旧服务端的单条 `update` / `css` / `full-reload` / `error` / `prune` 仍兼容。
+
+**边界与冒泡（C2）**：self-accept 分三类——适配器声明（Vue）、内置 CSS（产物自己调用 `accept()`）、用户手写的 `import.meta.hot.accept`（服务端文本扫描识别；注释里的误判最坏退化为一次 reload）。变化模块自己是边界就直接更新，否则沿 `Importers` 反向 BFS 到最近的边界；多个 importer 返回去重后的全部边界。任意路径抵达入口、无 importer 的孤儿模块、或环里找不到边界，都保守地整页刷新；`visited` 让环收敛，BFS 不会挂死。入口若显式 self-accept 则按普通边界处理，没有 accept 的入口改动/删除才整页刷新。删除文件时从"删除前记录的 importers"开始冒泡（节点本身已不能重新 import），重新执行边界会拿到真实的 import 错误覆盖层。
+
+**失败恢复**：首次加载就编译失败的模块从未入图，既没有节点也没有 importers。`failed` 集合记录这些 id（无扩展名请求会按 basename 匹配 `.ts` / `.vue` 等真实文件）；修好后下一次变更直接发 `full-reload`，页面重新走入口 import 并清掉覆盖层，而不是永远停在错误页。成功编译后清除标记。
+
+**说明符版本化（C3）**：浏览器对静态 ESM 有永久缓存，只给边界 URL 加 `?t` 不够——边界内部 import 的下游仍会命中旧模块。因此每次变更都把脏标记沿 importers 冒泡（`markDirtyLocked`）；服务任意模块时，`OnResolve` 发现某个本地依赖在脏表里，就把它改写成带 `?t=<该模块 last seq>` 的说明符：相对/绝对说明符只加 query（保留 `?raw` 与 `#hash`），别名说明符换成 canonical dev URL（import map 对带 query 的裸说明符不可靠），npm 裸导入、外部 URL、CSS 的 `@import` / `url()` 一律不动。没有变化的兄弟分支保持裸 URL，浏览器继续用缓存，子组件实例也不会被误重建。
+
+**Vue 组件热替换（A2）**：dev 下 SFC 产物带 `__script.__hmrId` / `__file` 与 `import.meta.hot.accept`；`__file` 是项目相对路径，不泄露构建机目录。服务端保存每个 SFC 上一次的脚本 hash（`<script>` + `<script setup>` 原文及其 lang），重新编译时比对：只有模板/样式变了就生成 `__VUE_HMR_RUNTIME__.rerender(scopeId, next.render)`，直接替换 render 并保留 setup 状态；脚本变了才生成 `reload(scopeId, next)`（组件实例重建）。依赖冒泡或删除引起的更新带 `mode:"reload"`，即使脚本 hash 没变也强制走 reload，确保 setup 闭包重新执行、用上 C3 版本化的新依赖。根组件的脚本改动由 Vue 的 reload 退化成整页刷新，模板/样式改动仍可 rerender。生产构建不走这条分支，client / SSR 产物里没有任何 HMR 符号（`TestProductionVueBuildsHaveNoHMRSymbols` 锁定）。
+
+> `accept(deps, cb)` 在切片 1 是保守契约：只声明依赖级 accept、没有 self-accept 的模块会整页刷新（见 `TestClientRuntimeDepsOnlyAcceptReloads`）。真正的依赖级粒度留给后续切片；`hot.decline()` 同批次的模块也直接刷新。
+
+**适配器 seam（A1a）**：`adapter` 包只依赖标准库，适配器实现 `Name / Extensions / SelfAccepts / HMRKind`；`adapter/vue` 是默认成员，`WithAdapters` 追加的适配器排在后面、同扩展名时胜出。扩展名监听、self-accept、update kind 与 `connected.capabilities` 全部由注册表驱动；DevServer 与 HMR 规划器只依赖接口，只有 `options_dev.go` 的默认装配认识具体实现。注意接口目前只覆盖"分类"：自定义格式的编译仍需要内置编译器（今天只有 Vue），适配器的编译钩子留给后续切片。
+
+**删除与原子保存（C6）**：`Remove|Rename` 不立刻删图节点，而是把"id + URL + 删除前的 importers"记进 prune 队列。flush 时以 `os.Stat` 为准而不是事件类型：文件存在就是 change，缺失才是 prune（Windows 原子保存的 Remove/Create 顺序并不可靠，Create 后紧跟 Remove 也要正确归类）。确认删除时先按 importers 规划边界，把 prune 与边界 update 放进同一条 batch，flush 后再从图里移除节点并清掉 SFC 脚本 hash；入口被删除直接 full-reload。图节点晚删一步，importers 才能用于恢复规划（`Graph.Remove` 也保留入边记录）。删除的依赖已经解析不到时，说明符版本化会回退到旧图里的 resolved 目标并照常补 `?t`——否则浏览器会命中删除前的模块缓存，删除看起来"什么都没发生"。删除链上的 importer 也被删除时（没有可重新执行的模块），整条 batch 退化为 full-reload，绝不会对已 prune 的 URL 发 update。
+
+**删除依赖的报错**：边界重新执行时 import 一个已删除的模块会拿到真实的 404/编译错误，客户端把响应体盖成错误层且**不刷新**；文件恢复后 `failed` 兜底触发整页刷新，覆盖层自动消失。
 
 > 错误一律是 `error` 返回值而不是 panic：goja 的 JS 异常本来就以 `*goja.Exception` 返回，各阶段再包上文件名与阶段名（`parse` / `compileScript` / `compileTemplate` / `compileStyle` / 预处理器）；`CompileSFCResult` 与 `preprocessStyle` 外面还各有一层 `recover`，保证即使 VM 或宿主回调出了意外，也不会把 dev server / 构建进程带走。
 
-**Windows 上的坑**：编辑器"改名式保存"（写 `.tmp` 再 rename）会先发 `Remove` 再发 `Create`。若在 `Remove` 时就广播，浏览器 `import()` 会撞上文件短暂不存在的 404。因此只监听 `Write|Create`，跳过 `Remove|Rename|Chmod`。
+**编译失败**：`import()` reject 时**不能刷新**（刷新只会白屏）。客户端回读那个 500 的响应体，把真正的错误盖在页面上，等下一次成功的 batch 自动收场（见 §7.4）。
+
+**防抖与发送队列**：watcher 事件先进 100ms 静默窗口去重（一次保存通常同时产生 `Write` 与 `Create`），`flushMu` 保证 drain → stat → 分配 seq → 规划 → 广播整段串行，因此只产生**一条 batch、一个 seq**，日志里的 `broadcast seq=N (...)` 就是一次保存的收敛结果。每个 WebSocket 连接有独立 writer goroutine、32 条消息缓冲、30s ping 与 10s 写期限；`connected` 先入队、再注册客户端、最后启动 writer，保证它是客户端收到的第一帧。读上限 64 KiB，够 `hot.send()` 传正常 JSON。慢客户端会被断开而不是阻塞 `d.mu`。`DevServer.Close()` 关闭 watcher、停止防抖、断开所有客户端（包括关闭瞬间刚注册的连接），并等待 watcher / writer goroutine 退出；可重复调用。
 
 ### 7.3 Go 侧热重载：supervise（dev/supervise/supervise.go）
 
@@ -826,7 +875,7 @@ wf dev     [appDir]         # 可选：-tags -run -watch -ldflags
 ```
 
 - 日常不需要任何参数：在含 `web/` 的目录直接 `wf install` / `wf build`（第三方项目是 `go tool wf ...`）。
-- `-split`（默认 `true`）：客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE。
+- `-split`（默认 `true`）：客户端做代码分割（ESM + vendor chunk）；`-split=false` 退回单文件 IIFE，入口 CSS 与静态资源仍会落盘。
 - `-prerender`（默认 `auto`）：存在 `<web>/routes.json` 就预渲染，额外产出 `dist/pages/*.html`，运行期可零引擎；显式传路径照用，传 `-` 关闭。
 - `-modules`（默认 `auto`）：先找有 `.store/manifest.json` 的 `wf_modules` / `node_modules`；否则用存在且有内容的目录（忽略只有空 `.store` 的中断安装）；都没有才落到 `wf_modules`。显式指定时不探测；非 `node_modules` 时自动作为 esbuild 的 `NodePaths`（等价 `NODE_PATH` 语义）。
 - `-no-public`：关闭 `<web>/public` → 产物目录的复制。默认在构建成功后复制，同名文件以 public 为准。
@@ -902,7 +951,7 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 
 | # | 严重度 | 限制 | 说明与缓解 |
 | --- | --- | --- | --- |
-| 1 | 🟢 已解 | ~~**dev 下 `.vue` 未接入**~~ | `dev/serveSrc` 已全面接入 `compiler.CompileSFC`，支持 SFC 模板、脚本、`<style>` / `<style scoped>` 提取并自动注入 DOM，HMR 广播实时热更。 |
+| 1 | 🟢 已解 | ~~**dev 下 `.vue` 未接入**~~ | `DevServer` 已接入 `compiler.CompileSFCResult`：SFC 模板/脚本、`<style>` / `<style scoped>` 提取并注入 DOM；组件级 HMR——模板/样式改动走 `rerender` 保留状态，脚本改动走 `reload`，根组件退化为整页刷新（§7.2）。 |
 | 2 | 🟡 中 | **goja 不支持 async generator / Intl** | 靠 `Target: ES2017` 兜底；若某依赖运行期硬用 `Intl`（如 i18n 格式化），按 §5.6 接回完整 ES2023 引擎（只需实现 `Renderer`，上层零改动）。 |
 | 3 | 🟡 中 | **SSG 页面内容构建期固定** | 动态数据只能靠客户端 hydration 或 API。需要真动态 SSR 的场景请用 `-tags dynamic`。 |
 | 4 | 🟢 低 | **`__WF_DATA__` 必须走 `json.Marshal`** | 已在 `assemble` 统一处理（默认转义 `<>&`）。**禁止**用 `fmt.Sprintf` 拼接。 |
@@ -935,7 +984,7 @@ hydrateRoot(document.getElementById('root')!, <App {...props} />)
 
 | 项 | 结果 |
 | --- | --- |
-| dev server `GET /` | ✅ 200 / 15,331 B（内联了错误覆盖层，见 §7.4；dev 不压缩，换取零依赖注入），含 `new WebSocket(...+'/__wf_hmr')` 与 `window.__wfOverlay` |
+| dev server `GET /` | ✅ 200；`/@wf/overlay.js` + 外部 `type=module` `/@wf/boot`，runtime 单独由 `/@wf/client` 加载；有别名 / npm 映射时另带内联 import map |
 | dev server `GET /src/App.tsx` | ✅ 200 / 633 B，正确转译为 `React.createElement("div", { className: "app", "data-ssr": "true" }` |
 | 动态 SSR `GET /` | ✅ 200 / 473 B / 毫秒级（goja 单次渲染 1.6–4.2 ms） |
 | 静态模式（移走磁盘 `web/dist`，纯 embed） | ✅ `/` 200/473B、`/about` 200/477B、`/nope` 404、`client.js` 200/816B、chunk 200/45,279B（gzip） |
@@ -969,6 +1018,18 @@ goja 动态 SSR 输出   ==   wf build -prerender 产物（运行期静态服务
 （引擎后端移除前还做过一次三方交叉：`完整 ES2023 引擎 == goja == 预渲染产物`，三条路径同样逐字节一致——这也正是后来敢删掉那个后端、只留 goja 的依据。）
 
 这是最关键的一条验证：它同时证明了 ① 构建期预渲染与运行期渲染走的是同一套 `assemble` 逻辑（否则 head/data/script 标签的拼装顺序必然漂移）；② 静态部署可以放心替换动态 SSR；③ 换引擎不会改变任何字节输出。
+
+### 11.5 HMR 协议 v2（Chromium + goja 实测）
+
+| 场景 | 结果 |
+| --- | --- |
+| 改嵌套 `Counter.vue` 的模板 | ✅ 只重新执行 Counter 边界；按钮计数从 3 保持为 3，无整页刷新 |
+| 改 `Counter.vue` 的 `<script setup>` | ✅ `runtime.reload` 生效，新脚本运行（实例重建、计数归零，符合 Vue 语义） |
+| 改被导入的普通 `util.ts`（无 accept、路径抵达入口） | ✅ 一条 `full-reload`；boot 重新执行，console 打出边界原因 |
+| 改 `.css` | ✅ `type:"css"` 更新，`data-wf-id` 样式标签原位替换，组件状态保留 |
+| 一次保存产生 Remove+Create | ✅ 服务端日志 `removed … (pending)` → `queued`；不 prune、不 404，只发一条 batch |
+| goja 客户端用例 | ✅ 未知消息/kind、重复 seq、dispose→import 顺序、prune、lost accept、legacy update、connected 能力表全部通过（`dev/runtime_goja_test.go`） |
+| 生产 client / SSR 产物 | ✅ `__hmrId` / `import.meta.hot` / `__VUE_HMR_RUNTIME__` / `createHotContext` / `__wfHotCreate` 零命中（`compiler/vue_hmr_test.go`） |
 
 ---
 
