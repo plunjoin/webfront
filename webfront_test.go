@@ -13,8 +13,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -740,6 +743,115 @@ func TestTemplateEngineMinimalConfig(t *testing.T) {
 	if src := e.clientScript(); src != "" {
 		t.Fatalf("无 EmbedFS 时不应注入客户端脚本，got %q", src)
 	}
+}
+
+// HTML shell 扩展：调用方可以补 html/body 属性与 head 标签，而不必替换模板。
+func TestRenderHTMLShellExtensions(t *testing.T) {
+	e := newTestEngine(t, Config{Renderer: &fakeRenderer{html: `<div id="root">x</div>`, head: `<style>.x{}</style>`}})
+	doc, err := e.RenderHTML("/", Page{
+		Props:     map[string]any{"locale": "en"},
+		Head:      Head{Title: "Shell"},
+		HTMLAttrs: `lang="en"`,
+		BodyAttrs: `class="plaza-body"`,
+		HeadHTML:  `<meta name="viewport" content="width=device-width, initial-scale=1.0">`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`<html lang="en">`,
+		`<body class="plaza-body">`,
+		`<meta name="viewport" content="width=device-width, initial-scale=1.0">`,
+		`<title>Shell</title>`,
+		`__WF_DATA__`,
+	} {
+		if !strings.Contains(doc, want) {
+			t.Fatalf("shell 缺少 %q:\n%s", want, doc)
+		}
+	}
+	if strings.Contains(doc, `<html >`) || strings.Contains(doc, `<body >`) {
+		t.Fatalf("空属性不应留下多余空格:\n%s", doc)
+	}
+}
+
+// SetRenderer：旧渲染器的在途渲染完成后才关闭，新请求立即使用新渲染器。
+func TestSetRendererWaitsForInflight(t *testing.T) {
+	old := &swapRenderer{html: "old", started: make(chan struct{}), release: make(chan struct{})}
+	e, err := New(Config{Mode: ModeSSR, Renderer: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	renderDone := make(chan error, 1)
+	go func() {
+		_, err := e.RenderHTML("/", Page{})
+		renderDone <- err
+	}()
+	select {
+	case <-old.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("旧渲染器没有被调用")
+	}
+
+	next := &swapRenderer{html: "new"}
+	swapDone := make(chan error, 1)
+	go func() { swapDone <- e.SetRenderer(next) }()
+
+	select {
+	case err := <-swapDone:
+		t.Fatalf("SetRenderer 不应在旧渲染完成前返回: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if old.closed.Load() {
+		t.Fatal("旧渲染器在在途渲染结束前被关闭")
+	}
+	close(old.release)
+	if err := <-renderDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-swapDone; err != nil {
+		t.Fatal(err)
+	}
+	if !old.closed.Load() {
+		t.Fatal("旧渲染器没有关闭")
+	}
+
+	doc, err := e.RenderHTML("/", Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doc, "new") || strings.Contains(doc, "old") {
+		t.Fatalf("热换后应使用新渲染器:\n%s", doc)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !next.closed.Load() {
+		t.Fatal("Close 应关闭当前渲染器")
+	}
+}
+
+type swapRenderer struct {
+	html    string
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	closed  atomic.Bool
+}
+
+func (r *swapRenderer) RenderHTML(url string, propsJSON []byte) (string, string, error) {
+	if r.started != nil {
+		r.once.Do(func() { close(r.started) })
+	}
+	if r.release != nil {
+		<-r.release
+	}
+	return r.html, "", nil
+}
+
+func (r *swapRenderer) Close() error {
+	r.closed.Store(true)
+	return nil
 }
 
 // WF_DEV 由 wf dev 注入：不改代码也能让错误可见。

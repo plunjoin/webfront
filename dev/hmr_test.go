@@ -588,8 +588,11 @@ func TestHMRRecoversExtensionlessFailedRequest(t *testing.T) {
 	get("/src/main.ts")
 	get("/src/App.js")
 	get("/src/util.ts")
-	if r := doGet(ds.Handler(), "/src/util"); r.Code != 200 {
-		t.Fatalf("extensionless GET = %d", r.Code)
+	if r := doGet(ds.Handler(), "/src/util"); r.Code != 302 || r.Header().Get("Location") != "/src/util.ts" {
+		t.Fatalf("extensionless GET = %d %q", r.Code, r.Header().Get("Location"))
+	}
+	if r := doGet(ds.Handler(), "/src/util.ts"); r.Code != 200 {
+		t.Fatalf("canonical util GET = %d", r.Code)
 	}
 	ch := captureBatches(t, ds)
 	utilPath := filepath.Join(ds.root, "src", "util.ts")

@@ -9,6 +9,7 @@ package dev
 // fsnotify 等只有开发态才需要的包。DevServer 专属的接线在 options_dev.go。
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,10 @@ type config struct {
 	publicDir   string
 	publicSet   bool
 	adapters    []adapter.Adapter
+	ssrEntry    string
+	ssrFactory  SSRRendererFactory
+	shell       ShellFunc
+	shellFile   string
 }
 
 // newConfig 依次应用选项。nil 选项直接跳过，方便调用方按条件构造。
@@ -122,6 +127,84 @@ func WithDefine(m map[string]string) Option {
 //
 // 不调用该选项时，默认把所有 root 依赖（manifest.Root / package.json
 // dependencies）外置，效果与 Vite 的 optimizeDeps 单例一致；传空参数则关闭自动外置。
+// SSRRenderer 是开发态 SSR 运行时需要的最小接口，由调用方注入具体实现
+// （见 dev/ssr 子包，用 jsruntime 建池）。dev 核心不认识 goja，不需要 SSR
+// 的工程不会把 JS 引擎链接进 dev 二进制。
+type SSRRenderer interface {
+	RenderHTML(url string, propsJSON []byte) (html, head string, err error)
+	Close() error
+}
+
+// SSRRendererFactory 用新编译的 SSR bundle 创建渲染器。旧渲染器会在所有
+// 在途渲染结束后由 DevServer 关闭。
+type SSRRendererFactory func(bundle []byte) (SSRRenderer, error)
+
+// Page 是项目侧渲染一张开发页面的输入。SSR 为 true 且配置了 WithSSR 时，
+// 页面先经当前 SSR bundle 渲染，再把结果注入 shell。
+type Page struct {
+	URL         string
+	Title       string
+	Description string
+	Props       map[string]any
+	Bootstrap   map[string]any // SPA 外壳的 __WF_BOOTSTRAP__（可选）
+	SSR         bool
+	HTMLAttrs   string
+	BodyAttrs   string
+	HeadHTML    string
+}
+
+// ShellData 传给 WithHTMLShell 的上下文。开发服务器负责注入 import map、
+// __WF_DATA__ / __WF_BOOTSTRAP__、overlay/boot 脚本与 SSR 结果；ShellFunc
+// 只决定文档骨架（lang/body class/title/meta 等）。
+type ShellData struct {
+	URL         string
+	SSR         bool
+	HTML        string // SSR 渲染出的 body 片段（SPA 外壳时为空）
+	SSRHead     string // SSR 渲染出的 head 片段（Vue 的 <style> 等）
+	Props       map[string]any
+	Bootstrap   map[string]any
+	Title       string
+	Description string
+	HTMLAttrs   string
+	BodyAttrs   string
+	HeadHTML    string
+	Request     *http.Request
+}
+
+// ShellFunc 返回一整页 HTML 骨架。若包含 <!--wf-head--> / <!--wf-body--> /
+// <!--wf-scripts--> 占位符，开发服务器会原位替换；否则自动注入 </head>
+// 与 </body> 前，并把空的 <div id="root"></div> 替换成 SSR 结果。
+type ShellFunc func(ShellData) ([]byte, error)
+
+// WithSSR 开启开发态 SSR bundle 热换。entry 是项目相对路径（如
+// "src/entry-server.vue.ts"）；factory 由 dev/ssr.Factory 提供。每次源码
+// 变更后异步重编译，成功后原子替换渲染器，页面请求立即使用新 bundle。
+//
+// entry 为空或 factory 为 nil 时 NewDevServer 返回错误：静默退化成 SPA
+// 会让"SSR 没生效"很难被发现。
+func WithSSR(entry string, factory SSRRendererFactory) Option {
+	return func(c *config) {
+		c.ssrEntry = strings.TrimSpace(entry)
+		c.ssrFactory = factory
+	}
+}
+
+// WithHTMLShell 定制开发态 HTML 骨架（见 ShellFunc）。生产构建不使用。
+func WithHTMLShell(fn ShellFunc) Option {
+	return func(c *config) {
+		c.shell = fn
+	}
+}
+
+// WithHTMLShellFile 用磁盘上的 HTML 文件作为开发态骨架（相对 root 或绝对
+// 路径）。dist/index.html 可直接复用：生产用的 client.js / client.css
+// 标签会自动剥掉，换成 dev 的 import map / overlay / boot。
+func WithHTMLShellFile(path string) Option {
+	return func(c *config) {
+		c.shellFile = strings.TrimSpace(path)
+	}
+}
+
 func WithExternal(specs ...string) Option {
 	return func(c *config) {
 		c.externalSet = true

@@ -111,6 +111,20 @@ globalThis.TextDecoder = TextDecoder;
 if (typeof globalThis.queueMicrotask === 'undefined') {
   globalThis.queueMicrotask = function(f){ Promise.resolve().then(f); };
 }
+// 开发态 SSR bundle（NODE_ENV=development）会走框架的 warning 分支，直接
+// 调用 console.warn/error。goja 没有宿主 console，缺了它 Vue 在
+// initFeatureFlags 阶段就 ReferenceError；生产 define 只是碰巧把这段裁掉。
+// 这里提供 no-op 宿主对象，生产 bundle 不受影响。
+if (typeof globalThis.console === 'undefined') {
+  var __wfConsoleNoop = function(){};
+  globalThis.console = {
+    log: __wfConsoleNoop, info: __wfConsoleNoop, warn: __wfConsoleNoop,
+    error: __wfConsoleNoop, debug: __wfConsoleNoop, trace: __wfConsoleNoop,
+    group: __wfConsoleNoop, groupEnd: __wfConsoleNoop, groupCollapsed: __wfConsoleNoop,
+    time: __wfConsoleNoop, timeEnd: __wfConsoleNoop, assert: __wfConsoleNoop,
+    count: __wfConsoleNoop, table: __wfConsoleNoop
+  };
+}
 `
 
 // renderScript 统一用 Promise.resolve().then 收口：

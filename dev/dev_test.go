@@ -307,15 +307,16 @@ func TestDevServeSrcResolvesExtension(t *testing.T) {
 	h := ds.Handler()
 
 	cases := []struct {
-		url     string
-		code    int
-		contain string
+		url      string
+		code     int
+		location string
+		contain  string
 	}{
-		{"/src/App", http.StatusOK, "App"},          // 无扩展名 → App.tsx
-		{"/src/App.tsx", http.StatusOK, "App"},      // 带扩展名照旧
-		{"/src/widgets", http.StatusOK, "w"},        // 目录 → widgets/index.ts
-		{"/src/data.json", http.StatusOK, "export"}, // JSON → ESM
-		{"/src/Nope", http.StatusNotFound, "模块不存在"}, // 真的不存在才 404
+		{"/src/App", http.StatusFound, "/src/App.tsx", "App"},            // 无扩展名 → canonical URL
+		{"/src/App.tsx", http.StatusOK, "", "App"},                       // 带扩展名照旧
+		{"/src/widgets", http.StatusFound, "/src/widgets/index.ts", "w"}, // 目录 → index.ts
+		{"/src/data.json", http.StatusOK, "", "export"},                  // JSON → ESM
+		{"/src/Nope", http.StatusNotFound, "", "模块不存在"},                  // 真的不存在才 404
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
@@ -323,6 +324,18 @@ func TestDevServeSrcResolvesExtension(t *testing.T) {
 		if rec.Code != c.code {
 			t.Errorf("GET %s = %d，期望 %d: %s", c.url, rec.Code, c.code, rec.Body.String())
 			continue
+		}
+		if c.location != "" {
+			if got := rec.Header().Get("Location"); got != c.location {
+				t.Errorf("GET %s redirect = %q，期望 %q", c.url, got, c.location)
+				continue
+			}
+			rec = httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, c.location, nil))
+			if rec.Code != http.StatusOK {
+				t.Errorf("GET %s（redirect 后）= %d: %s", c.location, rec.Code, rec.Body.String())
+				continue
+			}
 		}
 		if !strings.Contains(rec.Body.String(), c.contain) {
 			t.Errorf("GET %s 响应体缺少 %q: %s", c.url, c.contain, rec.Body.String())
@@ -377,11 +390,17 @@ func TestDevAliasImportMap(t *testing.T) {
 		}
 	}
 
-	// 别名解析出来的 URL 必须真的能被 dev server 提供（含无扩展名补全）。
+	// 别名解析出来的 URL 必须真的能被 dev server 提供。无扩展名请求先
+	// 302 到真实文件 URL，浏览器后续才能以文件为 base 解析相对 import。
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/src/widgets/Button", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/src/widgets/Button.tsx" {
+		t.Fatalf("GET /src/widgets/Button = %d %q: %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/src/widgets/Button.tsx", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /src/widgets/Button = %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET /src/widgets/Button.tsx = %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "button") {
 		t.Fatalf("Button 没有编译成 JS: %s", rec.Body.String())
@@ -424,8 +443,13 @@ func TestDevAliasServesProjectFiles(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/@fs/shared/util", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/@fs/shared/util.ts" {
+		t.Fatalf("GET /@fs/shared/util = %d %q: %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/@fs/shared/util.ts", nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /@fs/shared/util = %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("GET /@fs/shared/util.ts = %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "from-shared") {
 		t.Fatalf("/@fs 没有返回别名目标: %s", rec.Body.String())

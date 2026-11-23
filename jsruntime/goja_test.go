@@ -36,6 +36,33 @@ globalThis.__WF_APP__ = {
 	}
 }
 
+// 开发态 bundle（NODE_ENV=development）会调用 console.warn；宿主必须提供它，
+// 否则 Vue 的 initFeatureFlags 直接 ReferenceError。
+func TestPoolProvidesConsoleShim(t *testing.T) {
+	bundle := []byte(`
+globalThis.__WF_APP__ = {
+  render: function(url, props) {
+    console.warn('dev warning');
+    console.error('dev error');
+    return { html: '<div>ok</div>', head: '' };
+  }
+};
+`)
+	pool, err := New(bundle, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	html, _, err := pool.RenderHTML("/", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("console shim 未生效: %v", err)
+	}
+	if !strings.Contains(html, "ok") {
+		t.Fatalf("unexpected html: %s", html)
+	}
+}
+
 func TestPoolTimeoutAndRecovery(t *testing.T) {
 	// 构造一个在 /infinite 时死循环、在 /normal 时正常渲染的 bundle
 	bundle := []byte(`

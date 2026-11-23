@@ -75,6 +75,12 @@ type Page struct {
 	Props     map[string]any // 强类型数据（序列化进 VM 全局 + __WF_DATA__）
 	Head      Head           // SEO 元信息
 	Component string         // （预留）组件名
+
+	// Shell 扩展：让调用方在不替换整张模板的情况下定制文档外壳。
+	// 三个字段都是原样拼进 HTML 的片段，调用方负责转义。
+	HTMLAttrs string // <html> 的额外属性，如 `lang="zh-CN"`
+	BodyAttrs string // <body> 的额外属性，如 `class="plaza-body"`
+	HeadHTML  string // 追加到 </head> 前的自定义标签（viewport / favicon / robots 等）
 }
 
 type Head struct {
@@ -85,12 +91,16 @@ type Head struct {
 // Engine 是 webfront 的核心。
 type Engine struct {
 	cfg      Config
-	mode     Mode   // New 解析后的有效模式（Mode() 可见）
-	base     string // 归一化后的 BasePath："" 或 "/site"（无尾斜杠）
-	renderer Renderer
+	mode     Mode     // New 解析后的有效模式（Mode() 可见）
+	base     string   // 归一化后的 BasePath："" 或 "/site"（无尾斜杠）
 	clientFS fs.FS    // 生产态嵌入的客户端产物（//go:embed），nil 表示未配置
 	assets   sync.Map // 静态资源缓存：name -> *staticAsset（含 gzip 预压缩体）
 	dev      bool     // 开发态：渲染失败时把 goja 栈摆到浏览器上（否则只给 500）
+
+	// rendererMu 让 SSR bundle 热换（SetRenderer）与正在进行的渲染互斥：
+	// 旧池必须在所有读者退出后才能关闭，新请求立即使用新池。
+	rendererMu sync.RWMutex
+	renderer   Renderer
 }
 
 // New 组装引擎并解析有效运行模式。
@@ -204,12 +214,35 @@ func (e *Engine) stripBase(p string) string {
 
 // Static 表示当前引擎没有 JS 渲染器（预渲染 / 纯静态产物）。
 // 自动模式下 Renderer == nil 也可能解析成 ModeSPA：判断有效形态请用 Mode()。
-func (e *Engine) Static() bool { return e.renderer == nil }
+func (e *Engine) Static() bool {
+	e.rendererMu.RLock()
+	defer e.rendererMu.RUnlock()
+	return e.renderer == nil
+}
 
-// Close 释放渲染器（若有）。
+// SetRenderer 原子替换 SSR 渲染器（开发期 bundle 热换），并关闭旧渲染器。
+// 正在进行的渲染会先完成，旧池不会在请求中途被关闭；替换后新请求立即用新池。
+// 传 nil 表示卸载渲染器（之后 Render 会退回预渲染页 / 报无渲染器）。
+// Mode() 不会被重新解析：热换只改变"由谁执行 JS"，不改变引擎形态。
+func (e *Engine) SetRenderer(r Renderer) error {
+	e.rendererMu.Lock()
+	old := e.renderer
+	e.renderer = r
+	e.rendererMu.Unlock()
+	if old != nil && old != r {
+		return old.Close()
+	}
+	return nil
+}
+
+// Close 释放渲染器（若有）。可重复调用。
 func (e *Engine) Close() error {
-	if e.renderer != nil {
-		return e.renderer.Close()
+	e.rendererMu.Lock()
+	r := e.renderer
+	e.renderer = nil
+	e.rendererMu.Unlock()
+	if r != nil {
+		return r.Close()
 	}
 	return nil
 }
@@ -217,9 +250,6 @@ func (e *Engine) Close() error {
 // RenderHTML 渲染成完整 HTML 字符串（不写 ResponseWriter，预渲染也用它）。
 // url 传"前端视角"的路径（如 "/about"），不要带 BasePath —— 预渲染产物里存的就是这个。
 func (e *Engine) RenderHTML(url string, page Page) (string, error) {
-	if e.renderer == nil {
-		return "", fmt.Errorf("webfront: 静态模式无渲染器（页面应由 wf build -prerender 预先生成）")
-	}
 	if url == "" {
 		url = page.URL
 	}
@@ -227,11 +257,22 @@ func (e *Engine) RenderHTML(url string, page Page) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	html, head, err := e.renderer.RenderHTML(url, propsJSON)
+	html, head, err := e.renderParts(url, propsJSON)
 	if err != nil {
 		return "", err
 	}
 	return e.assemble(head, html, page), nil
+}
+
+// renderParts 在渲染器锁内取当前渲染器并完成一次渲染。SetRenderer 会在
+// 所有读者退出后才关闭旧池，因此这里可以安全地持有 RLock 直到渲染返回。
+func (e *Engine) renderParts(url string, propsJSON []byte) (string, string, error) {
+	e.rendererMu.RLock()
+	defer e.rendererMu.RUnlock()
+	if e.renderer == nil {
+		return "", "", fmt.Errorf("webfront: 静态模式无渲染器（页面应由 wf build -prerender 预先生成）")
+	}
+	return e.renderer.RenderHTML(url, propsJSON)
 }
 
 // assemble 拼装完整 HTML：head + hydration 数据 + 客户端脚本 + SEO 元信息与样式自动补齐。
@@ -248,12 +289,16 @@ func (e *Engine) assemble(head, html string, page Page) string {
 	if e.hasClientCSS() && !strings.Contains(head, "assets/client.css") {
 		head += `<link rel="stylesheet" href="` + e.base + `/assets/client.css">`
 	}
+	// 4. 调用方追加的自定义 head 片段（viewport / favicon / theme-color 等）
+	head += page.HeadHTML
 
 	// json.Marshal 默认转义 <>&，防 XSS（§6 #5）
 	dataJSON, _ := json.Marshal(page.Props)
-	doc := "<!doctype html><html><head>" + head +
+	htmlAttrs := shellAttrs(page.HTMLAttrs)
+	bodyAttrs := shellAttrs(page.BodyAttrs)
+	doc := "<!doctype html><html" + htmlAttrs + "><head>" + head +
 		`<script id="__WF_DATA__" type="application/json">` + string(dataJSON) + `</script>` +
-		"</head><body>" + html + "</body></html>"
+		"</head><body" + bodyAttrs + ">" + html + "</body></html>"
 
 	// type="module"：代码分割产物是 ESM；模块脚本天然 defer，不阻塞解析；
 	// 未拆分的 IIFE 在模块里同样可以执行，两种产物共用同一个标签。
@@ -262,6 +307,15 @@ func (e *Engine) assemble(head, html string, page Page) string {
 			`<script type="module" src="`+src+`"></script></body>`, 1)
 	}
 	return doc
+}
+
+// shellAttrs 把调用方给的属性片段拼成带前导空格的形式；空串保持空。
+func shellAttrs(attrs string) string {
+	attrs = strings.TrimSpace(attrs)
+	if attrs == "" {
+		return ""
+	}
+	return " " + attrs
 }
 
 func (e *Engine) hasClientCSS() bool {
@@ -303,7 +357,7 @@ func (e *Engine) Render(w http.ResponseWriter, r *http.Request, page Page) error
 		url = r.URL.Path
 	}
 	url = e.stripBase(url) // 前端看到的始终是 /about，不是 /site/about
-	if e.renderer != nil {
+	if !e.Static() {
 		doc, err := e.RenderHTML(url, page)
 		if err != nil {
 			// 关键：这里必须自己写响应。调用方普遍写成 `_ = eng.Render(...)`，

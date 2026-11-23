@@ -92,8 +92,13 @@ export default function App() { return <div>{Child}{logo}</div> }
 	}
 
 	// /src 与 /@fs 必须落到同一个节点，URL 统一成 canonical /src 形式。
-	if rec := doGet(h, "/@fs/src/App.tsx"); rec.Code != http.StatusOK {
-		t.Fatalf("GET /@fs/src/App.tsx = %d: %s", rec.Code, rec.Body.String())
+	// /@fs/src/... 会被 302 到 /src/...，浏览器跟随后再编译入图。
+	rec = doGet(h, "/@fs/src/App.tsx")
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/src/App.tsx" {
+		t.Fatalf("GET /@fs/src/App.tsx = %d %q: %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	if rec := doGet(h, "/src/App.tsx"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /src/App.tsx（canonical）= %d: %s", rec.Code, rec.Body.String())
 	}
 	appFS, _ := ds.Module("src/App.tsx")
 	if appFS.URL != "/src/App.tsx" || appFS.Version != app.Version {

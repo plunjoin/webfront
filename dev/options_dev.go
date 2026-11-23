@@ -22,6 +22,10 @@ func (d *DevServer) applyConfig(c *config) {
 	d.publicDir = c.publicDir
 	d.publicSet = c.publicSet
 	d.userDefine = c.define
+	d.ssrEntry = c.ssrEntry
+	d.ssrFactory = c.ssrFactory
+	d.shell = c.shell
+	d.shellFile = c.shellFile
 	if c.externalSet {
 		d.externalSet = true
 		d.externals = c.externals

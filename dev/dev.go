@@ -6,11 +6,13 @@
 package dev
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -126,6 +128,23 @@ type DevServer struct {
 	errMu   sync.Mutex
 	errSeq  int64
 	lastErr *compileError
+
+	// 开发态 SSR：entry / factory 来自 WithSSR；bundle 在后台重编译后
+	// 原子替换 renderer。ssrMu 的写锁会等在途渲染退出后才关闭旧池。
+	ssrEntry    string
+	ssrFactory  SSRRendererFactory
+	ssrRenderer SSRRenderer
+	ssrMu       sync.RWMutex
+	ssrTrigger  chan struct{}
+	ssrStateMu  sync.Mutex
+	ssrLastErr  string
+	ssrHadError bool
+	ssrBuilds   int64
+
+	// HTML shell：WithHTMLShell 优先，其次 WithHTMLShellFile。
+	shell         ShellFunc
+	shellFile     string
+	shellTemplate []byte
 }
 
 // compileError 是一条编译错误的快照，JSON 直接喂给浏览器。
@@ -241,6 +260,28 @@ func NewDevServer(root string, opts ...Option) (*DevServer, error) {
 	}
 	d.applyConfig(newConfig(opts))
 
+	// SSR 与 HTML shell 的配置在启动时就校验：静默退化成 SPA 会让
+	// "SSR 没生效" 很难被发现。shell 文件也只读一次，运行中改它需重启。
+	if (d.ssrEntry == "") != (d.ssrFactory == nil) {
+		_ = w.Close()
+		if d.ssrEntry == "" {
+			return nil, fmt.Errorf("dev: WithSSR 需要非空的 entry 与 factory（当前 factory 非 nil 但 entry 为空）")
+		}
+		return nil, fmt.Errorf("dev: WithSSR(%q) 缺少 SSR 渲染器 factory（用 dev/ssr.Factory）", d.ssrEntry)
+	}
+	if d.shell == nil && d.shellFile != "" {
+		shellPath := d.shellFile
+		if !filepath.IsAbs(shellPath) {
+			shellPath = filepath.Join(abs, filepath.FromSlash(shellPath))
+		}
+		b, err := os.ReadFile(shellPath)
+		if err != nil {
+			_ = w.Close()
+			return nil, fmt.Errorf("dev: 读取 HTML shell %s: %w", shellPath, err)
+		}
+		d.shellTemplate = stripProdClientAssets(b)
+	}
+
 	// public/：显式 WithPublicDir 优先，否则用 <root>/public（存在才托管）。
 	// 路径启动时固定，但每次请求都重新 stat，运行中新建的 public/ 也能生效。
 	if !d.publicSet {
@@ -311,6 +352,18 @@ func NewDevServer(root string, opts ...Option) (*DevServer, error) {
 			continue
 		}
 		fmt.Printf("[alias] %s -> %s\n", a.Prefix, a.Target)
+	}
+	// SSR：先同步编译一次，页面从第一个请求起就能拿到真实 HTML；失败也
+	// 不阻塞启动（源码可能正停在半成品状态），保留 nil renderer 并靠下一次
+	// 文件变更重试。后续重编译在 ssrLoop 里串行进行。
+	if d.ssrEntry != "" {
+		d.ssrTrigger = make(chan struct{}, 1)
+		d.rebuildSSR(false)
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.ssrLoop()
+		}()
 	}
 	// fsnotify 不递归：必须把 src 下每一层子目录都加进监听，
 	// 否则改 src/components/Foo.vue 这种文件时 HMR 完全收不到事件。
@@ -544,6 +597,10 @@ func (d *DevServer) flushChanges() {
 	if len(changes) == 0 && len(prunes) == 0 {
 		return
 	}
+	// SSR bundle 也要跟着重编译：即使某个源文件还没被浏览器请求过，
+	// 它也可能改变 entry-server 的产物。trigger 是容量 1 的非阻塞信号，
+	// 编译期间的多次保存会合并成下一次重建。
+	d.kickSSR()
 	sort.Slice(changes, func(i, j int) bool { return changes[i].id < changes[j].id })
 	sort.Slice(prunes, func(i, j int) bool { return prunes[i].id < prunes[j].id })
 
@@ -744,6 +801,16 @@ func (d *DevServer) Close() error {
 		d.mu.Unlock()
 	})
 	d.wg.Wait()
+	// ssrLoop 已退出；拿写锁会等在途 RenderHTML 结束，然后才能关旧池。
+	d.ssrMu.Lock()
+	renderer := d.ssrRenderer
+	d.ssrRenderer = nil
+	d.ssrMu.Unlock()
+	if renderer != nil {
+		if e := renderer.Close(); err == nil {
+			err = e
+		}
+	}
 	return err
 }
 
@@ -798,16 +865,57 @@ func (d *DevServer) Handler() http.Handler {
 		case p == d.basePath:
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = "/"
-			mux.ServeHTTP(w, r2)
+			mux.ServeHTTP(&basePathLocationWriter{ResponseWriter: w, base: d.basePath}, r2)
 		case strings.HasPrefix(p, d.basePath+"/"):
 			r2 := r.Clone(r.Context())
 			r2.URL.Path = strings.TrimPrefix(p, d.basePath)
-			mux.ServeHTTP(w, r2)
+			// ServeMux 的 clean-path / 补尾斜杠重定向发生在前缀剥离之后，
+			// Location 会变成不带 basePath 的 /src/…；这里补回去。
+			mux.ServeHTTP(&basePathLocationWriter{ResponseWriter: w, base: d.basePath}, r2)
 		default:
-			// 调用方已经 StripPrefix 过：路径本来就是内部形态，直接交给 mux。
-			mux.ServeHTTP(w, r)
+			// 调用方已经 StripPrefix 过：路径本来就是内部形态。ServeMux 的
+			// 重定向同样补前缀；writer 只在 Location 缺少前缀时改写，带前缀
+			// 的 canonical / public 重定向不会被二次加前缀。
+			mux.ServeHTTP(&basePathLocationWriter{ResponseWriter: w, base: d.basePath}, r)
 		}
 	})
+}
+
+// basePathLocationWriter 只修正 ServeMux 生成的重定向 Location，并透传
+// Hijack/Flush，保证挂在前缀下的 HMR WebSocket 仍能升级。
+type basePathLocationWriter struct {
+	http.ResponseWriter
+	base string
+}
+
+func (w *basePathLocationWriter) WriteHeader(code int) {
+	switch code {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		loc := w.Header().Get("Location")
+		if strings.HasPrefix(loc, "/") && loc != w.base && !strings.HasPrefix(loc, w.base+"/") {
+			w.Header().Set("Location", w.base+loc)
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *basePathLocationWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("dev: response writer 不支持 Hijack")
+	}
+	return h.Hijack()
+}
+
+func (w *basePathLocationWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *basePathLocationWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (d *DevServer) serveLastError(w http.ResponseWriter, r *http.Request) {
@@ -841,6 +949,17 @@ func (d *DevServer) servePublic(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	if fi.IsDir() {
+		// 目录请求统一带尾斜杠：/docs → /docs/，否则 index.html 里的
+		// 相对链接会以父目录为 base 解析（和文件系统语义不一致）。
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			target := d.url("/" + rel + "/")
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			http.Redirect(w, r, target, http.StatusFound)
+			return true
+		}
 		full = filepath.Join(full, "index.html")
 		if fi, err = os.Stat(full); err != nil || fi.IsDir() {
 			return false
@@ -855,7 +974,7 @@ func (d *DevServer) servePublic(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// serveIndex 注入 HMR 客户端脚本 + ImportMap + 模块入口。
+// serveIndex 是默认页面：public/ 静态文件优先，其余交给 RenderPage。
 func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 	// public/：内部路由（/src、/@deps、/@fs、/__wf_*）由 mux 的精确前缀先行命中，
 	// 剩下的路径先看 <root>/public；根路径永远给 HMR 外壳，public/index.html
@@ -865,52 +984,7 @@ func (d *DevServer) serveIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	importMap := map[string]any{
-		"imports": map[string]string{},
-	}
-	imports := importMap["imports"].(map[string]string)
-	d.mu.Lock()
-	for pkg := range d.rootDeps {
-		imports[pkg] = d.url("/@deps/" + pkg + ".js")
-		imports[pkg+"/"] = d.url("/@deps/" + pkg + "/")
-	}
-	// 显式 WithExternal 指定的包即使不在 rootDeps 里也要有映射，
-	// 否则浏览器无法解析外置后的裸导入。
-	for pkg := range d.externals {
-		if _, ok := imports[pkg]; ok {
-			continue
-		}
-		imports[pkg] = d.url("/@deps/" + pkg + ".js")
-		imports[pkg+"/"] = d.url("/@deps/" + pkg + "/")
-	}
-	d.mu.Unlock()
-
-	// 别名放在依赖之后：同名时用户显式配置的别名优先于 npm 包。
-	for _, a := range d.aliases {
-		if key, val, ok := d.aliasImport(a); ok {
-			imports[key] = val
-		}
-	}
-
-	importMapJSON, _ := json.MarshalIndent(importMap, "  ", "  ")
-	importMapTag := ""
-	if len(imports) > 0 {
-		importMapTag = "\n  <script type=\"importmap\">\n  " + string(importMapJSON) + "\n  </script>\n"
-	}
-
-	// 覆盖层（经典脚本）先执行，module 引导随后；两者都是外部脚本，
-	// 严格 CSP 下不用为应用代码开 unsafe-inline。import map 必须在使用
-	// 它的 module script 之前；它本身是内联 JSON，完整 CSP 需调用方配 nonce。
-	html := "<!doctype html><html><head><meta charset=\"utf-8\"><title>webfront dev (HMR)</title>" +
-		importMapTag +
-		"</head>\n<body>\n<div id=\"root\"></div>\n" +
-		"<script src=\"" + d.url("/@wf/overlay.js") + "\"></script>\n" +
-		"<script type=\"module\" src=\"" + d.url("/@wf/boot") + "\"></script>\n" +
-		"</body></html>"
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(html))
+	d.RenderPage(w, r, Page{})
 }
 
 // serveDeps 按需打包 npm 依赖包为 ESM 并缓存。
@@ -1051,7 +1125,7 @@ func (d *DevServer) bundleDepCSS(pkgSpec string, plugins []api.Plugin) ([]byte, 
 //
 // 源 CSS 同时是一个 HMR 边界：hmr=true 时注入 runtime + self-accept，
 // 重新执行模块本身就会替换样式；依赖包里的 CSS（/@deps/...）不参与 HMR。
-func cssModuleJS(css, id, ownerURL, clientURL string, hmr bool) []byte {
+func cssModuleJS(css, id, ownerURL, clientURL string, hmr bool, depImports ...string) []byte {
 	idJSON, _ := json.Marshal(id)
 	cssJSON, _ := json.Marshal(css)
 	prefix, suffix := "", ""
@@ -1060,10 +1134,16 @@ func cssModuleJS(css, id, ownerURL, clientURL string, hmr bool) []byte {
 			"import.meta.hot = __wfHotCreate(" + strconv.Quote(ownerURL) + ");\n"
 		suffix = "\nif (import.meta.hot) import.meta.hot.accept();"
 	}
+	// 顶层 @import 已由 transformCSS 变成真正的模块依赖：它们必须在本模块
+	// 注入样式之前执行，CSS 级联顺序才和源文件一致。
+	for _, dep := range depImports {
+		prefix += "import " + strconv.Quote(dep) + ";\n"
+	}
 	return []byte(prefix + "var id=" + string(idJSON) +
 		";var old=null;document.querySelectorAll('style[data-wf-id]').forEach(function(e){if(e.getAttribute('data-wf-id')===id)old=e;});" +
-		"if(old)old.remove();const s=document.createElement('style');s.setAttribute('data-wf-id',id);s.textContent=" + string(cssJSON) +
-		";document.head.appendChild(s);export default s.textContent;" + suffix)
+		"const s=document.createElement('style');s.setAttribute('data-wf-id',id);s.textContent=" + string(cssJSON) +
+		";if(old&&old.parentNode){old.parentNode.replaceChild(s,old);}else{document.head.appendChild(s);}" +
+		"export default s.textContent;" + suffix)
 }
 
 // aliasImport 把一个别名转成 import map 条目。
@@ -1157,6 +1237,14 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 		http.Error(w, body, http.StatusNotFound)
 		return
 	}
+	// 浏览器不做扩展名/index 补全：`import './router'` 请求 /src/router，
+	// `import './lib/i18n'` 请求 /src/lib/i18n。这里已经把它解析到真实文件，
+	// 但模块仍会以"请求 URL"为 base 解析内部的相对 import——目录会被当成
+	// 文件，`./en` 就会跑到 /src/lib/en。先 302 到真实文件的 canonical URL，
+	// 浏览器后续就以文件 URL 解析相对路径，HMR 的 owner URL 也才对得上。
+	if d.redirectCanonical(w, r, full) {
+		return
+	}
 	// Sourcefile 用项目相对路径（src/App.tsx），错误信息里的文件名才和构建期一致。
 	rel = filepath.ToSlash(full)
 	if r2, relErr := filepath.Rel(d.root, full); relErr == nil {
@@ -1193,7 +1281,8 @@ func (d *DevServer) serveURL(w http.ResponseWriter, r *http.Request, urlPrefix, 
 			d.failModule(w, srcURL, err.Error(), id)
 			return
 		}
-		out := cssModuleJS(string(code), id, srcURL, d.url("/@wf/client"), true)
+		cssText, cssImports, imports := d.transformCSS(string(code), full, imports)
+		out := cssModuleJS(cssText, id, srcURL, d.url("/@wf/client"), true, cssImports...)
 		d.recordModule(full, module.KindCSS, out, imports, true, "css")
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write(out)
@@ -1492,6 +1581,44 @@ func (d *DevServer) serveAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, full)
+}
+
+// canonicalPath 去掉挂载前缀，只比较 dev server 内部路径。
+// 请求可能已经过 basePath wrapper 或 http.StripPrefix，两种形态都认。
+func (d *DevServer) canonicalPath(p string) string {
+	if d.basePath == "" {
+		return p
+	}
+	if p == d.basePath {
+		return "/"
+	}
+	if strings.HasPrefix(p, d.basePath+"/") {
+		return strings.TrimPrefix(p, d.basePath)
+	}
+	return p
+}
+
+// redirectCanonical 把"扩展名/index 补全后的请求 URL"重定向到真实文件 URL。
+// 必须在 readSrc 解析成功之后调用；查询串（?t / ?raw）原样带过去，
+// 302 而不是 301：文件解析结果可能随目录内容变化，不能被浏览器长期缓存。
+func (d *DevServer) redirectCanonical(w http.ResponseWriter, r *http.Request, full string) bool {
+	canonical, ok := d.devURL(full)
+	if !ok || canonical == "" {
+		return false
+	}
+	// 必须按原样比较：path.Clean 会把 /src/router.ts/ 当成 /src/router.ts，
+	// 但浏览器解析相对 import 时尾斜杠会改变 base，模块会请求到
+	// /src/router.ts/pages/x 这种 404 URL。
+	if d.canonicalPath(canonical) == d.canonicalPath(r.URL.Path) {
+		return false
+	}
+	target := canonical
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, target, http.StatusFound)
+	return true
 }
 
 // readSrc 读源码文件，并按 Vite 的规则补全路径。
